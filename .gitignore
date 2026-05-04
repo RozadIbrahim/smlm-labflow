@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+*.egg-info/
+
+# PyCharm
+.idea/
+
+# Data / results
+data/
+datasets/
+results/
+outputs/
+*.tif
+*.tiff
+*.ome.tif
+*.ome.tiff
+*.csv
+*.h5
+*.pkl
+*.pt
+*.pth
+*.ckpt
+
+# Notebooks checkpoints
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db

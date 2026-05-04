@@ -1,0 +1,41 @@
+name: liteloc_env
+
+channels:
+  - turagalab
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Conda part: minimal, author-style
+  - python=3.9.21
+  - pip
+  - setuptools
+  - wheel
+  - git
+
+  # LiteLoc author method:
+  # conda install -c turagalab -c conda-forge spline
+  - spline
+
+  # Pip part: exact LiteLoc requirements
+  - pip:
+      - -f https://download.pytorch.org/whl/torch_stable.html
+      - torch==2.2.2+cu121
+      - torchaudio==2.2.2+cu121
+      - torchvision==0.17.2+cu121
+      - natsort==8.4.0
+      - omegaconf==2.3.0
+      - PyYAML==5.4.1
+      - RecursiveNamespace==0.2.2
+      - thop==0.1.1.post2209072238
+      - tifffile==2023.7.10
+      - numpy==1.24.4
+      - tqdm
+      - Deprecated
+      - h5py
+      - hdfdict
+      - matplotlib
+      - pandas
+      - scipy
+      - scikit-image
+      - dotted-dict

@@ -1,0 +1,49 @@
+profile_name: dna_paint_standard
+
+backend:
+  name: liteloc
+  variant: liteloc_astig_pretrained
+  command_template: null
+  mock_output: false
+
+psf:
+  dimensionality: 3d
+  type: astigmatic
+  calibration_file: /common_data/conda_envs/LiteLoc/calibrate_mat/astig_npc_psf_model.mat
+
+inference:
+  batch_size: 64
+  threshold: 0.25  # currently metadata unless explicitly used by adapter/converter
+  data_queue_size: 100
+
+output:
+  raw_output_name: liteloc_raw_output.csv
+  canonical_output_name: canonical_localizations.csv
+  runtime_yaml_name: runtime_liteloc_infer.yaml
+  log_name: liteloc.log
+
+canonical:
+  coordinate_unit: nm
+  frame_indexing: one_based_observed
+  confidence_source_column: prob
+  background_available: false
+
+downstream:
+  export_picasso: true
+  export_smap: false
+  export_napari: true
+
+liteloc:
+  repo_dir: /common_data/conda_envs/LiteLoc
+  infer_script: demo/demo1_astig_npc/liteloc_infer_demo1.py
+  base_infer_yaml: demo/demo1_astig_npc/infer_params_demo1.yaml
+  model_path: /common_data/conda_envs/LiteLoc/results/liteloc_demo1/checkpoint.pkl
+
+  runtime:
+    time_block_gb: 1
+    batch_size: 64
+    sub_fov_size: 256
+    over_cut: 8
+    data_queue_size: 100
+    multi_gpu: false
+    num_producers: 1

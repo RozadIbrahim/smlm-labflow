@@ -1,0 +1,20 @@
+name: napari_locan
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - napari
+  - pyqt
+  - locan
+  - napari-locan
+  - pandas
+  - numpy
+  - scipy
+  - matplotlib
+  - tifffile
+  - h5py
+  - jupyterlab
+  - ipykernel
