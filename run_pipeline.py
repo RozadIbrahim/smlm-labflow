@@ -4,19 +4,41 @@ run_pipeline.py
 
 Main SMLM wrapper pipeline.
 
-Automatic behavior:
-    - Accept one TIFF/OME-TIFF file OR a folder of TIFF/OME-TIFF files.
-    - Discover all movies automatically.
-    - Run qc_input.py automatically through qc_one_movie().
-    - Run LiteLoc adapter automatically if adapters/liteloc_adapter.py exists.
-    - Run canonical conversion automatically if raw backend output exists.
-    - Record runtime benchmark automatically through runtime_benchmark.py.
+User-facing CLI.
+
+Architecture:
+    QC
+    → LiteLoc adapter
+    → post_inference.run_post_inference()
+        → canonical CSV
+        → localization QC
+        → SMAP/Picasso/napari/Locan adapted exports
+    → combined run-level exports
+    → supervisor-friendly report
+
+Important:
+    This script does NOT open napari and does NOT run Locan analysis.
+    napari/Locan review should be run separately in napari_locan_env using
+    napari_locan_review.py.
 
 Normal command:
     python run_pipeline.py \
         --input data/raw_movies \
         --out results/run_001 \
-        --profile profiles/dna_paint_standard.yaml
+        --profile profiles/dna_paint_standard.yaml \
+        --backend liteloc \
+        --coord-units nm \
+        --pixel-size-nm 65
+
+Quick test:
+    python run_pipeline.py \
+        --input data/raw_movies \
+        --out results/test_run \
+        --profile profiles/dna_paint_standard.yaml \
+        --backend liteloc \
+        --coord-units nm \
+        --pixel-size-nm 65 \
+        --max-files 1
 """
 
 from __future__ import annotations
@@ -43,10 +65,9 @@ TIFF_EXTENSIONS = (
 )
 
 
-# ---------------------------------------------------------------------
+# =============================================================================
 # Basic utilities
-# ---------------------------------------------------------------------
-
+# =============================================================================
 
 def is_tiff(path: Path) -> bool:
     name = path.name.lower()
@@ -72,6 +93,35 @@ def make_run_id(path: Path, index: int) -> str:
     return f"{index:04d}_{safe_stem(path)}_{digest}"
 
 
+def display_path(path: Path | str | None, base: Optional[Path] = None) -> str:
+    """
+    Return a clean relative path for terminal output when possible.
+    Internal paths remain absolute.
+    """
+    if path is None:
+        return ""
+
+    path = Path(path)
+
+    if str(path).strip() == "":
+        return ""
+
+    try:
+        path = path.expanduser().resolve()
+    except Exception:
+        return str(path)
+
+    if base is None:
+        base = Path.cwd().resolve()
+    else:
+        base = Path(base).expanduser().resolve()
+
+    try:
+        return str(path.relative_to(base))
+    except ValueError:
+        return str(path)
+
+
 def discover_tiff_movies(input_path: Path) -> List[Path]:
     input_path = input_path.expanduser().resolve()
 
@@ -89,10 +139,13 @@ def discover_tiff_movies(input_path: Path) -> List[Path]:
 
 
 def write_json(data: Any, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         json.dumps(data, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+
+
 def get_numbered_out_dir(out_dir: Path, force: bool = False) -> Path:
     """
     Return a safe output directory.
@@ -103,11 +156,6 @@ def get_numbered_out_dir(out_dir: Path, force: bool = False) -> Path:
         - If out_dir exists and is non-empty:
             - with --force: reuse it.
             - without --force: create numbered sibling folder.
-
-    Example:
-        results/run_real_liteloc
-        results/run_real_liteloc_001
-        results/run_real_liteloc_002
     """
     out_dir = out_dir.expanduser().resolve()
 
@@ -123,7 +171,6 @@ def get_numbered_out_dir(out_dir: Path, force: bool = False) -> Path:
     parent = out_dir.parent
     base_name = out_dir.name
 
-    # If user already gave run_001, make next as run_002, not run_001_001.
     match = re.match(r"^(.*?)(?:_(\d{3,}))$", base_name)
 
     if match:
@@ -142,9 +189,8 @@ def get_numbered_out_dir(out_dir: Path, force: bool = False) -> Path:
         if candidate.is_dir() and not any(candidate.iterdir()):
             return candidate
 
-    raise RuntimeError(
-        f"Could not find available numbered output directory for: {out_dir}"
-    )
+    raise RuntimeError(f"Could not find available numbered output directory for: {out_dir}")
+
 
 def flatten_for_csv(row: Dict[str, Any]) -> Dict[str, Any]:
     clean: Dict[str, Any] = {}
@@ -159,6 +205,8 @@ def flatten_for_csv(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def write_manifest_csv(rows: List[Dict[str, Any]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
     if not rows:
         path.write_text("", encoding="utf-8")
         return
@@ -178,10 +226,9 @@ def write_manifest_csv(rows: List[Dict[str, Any]], path: Path) -> None:
             writer.writerow(flatten_for_csv(row))
 
 
-# ---------------------------------------------------------------------
+# =============================================================================
 # Profile loading
-# ---------------------------------------------------------------------
-
+# =============================================================================
 
 def load_profile(profile_path: Path) -> Dict[str, Any]:
     profile_path = profile_path.expanduser().resolve()
@@ -211,6 +258,17 @@ def load_profile(profile_path: Path) -> Dict[str, Any]:
     return profile
 
 
+def get_nested(data: Dict[str, Any], keys: List[str], default: Any = None) -> Any:
+    current: Any = data
+
+    for key in keys:
+        if not isinstance(current, dict):
+            return default
+        current = current.get(key)
+
+    return default if current is None else current
+
+
 def get_backend_name(profile: Dict[str, Any], cli_backend: Optional[str]) -> str:
     if cli_backend:
         return cli_backend
@@ -223,10 +281,50 @@ def get_backend_name(profile: Dict[str, Any], cli_backend: Optional[str]) -> str
     return "liteloc"
 
 
-# ---------------------------------------------------------------------
-# Dynamic imports
-# ---------------------------------------------------------------------
+def infer_pixel_size_nm(
+    profile: Dict[str, Any],
+    cli_pixel_size_nm: Optional[float],
+) -> Optional[float]:
+    """
+    Resolve pixel size from CLI first, then profile.
 
+    Supported profile locations:
+        pixel_size_nm
+        data.pixel_size_nm
+        input.pixel_size_nm
+        camera.pixel_size_nm
+        acquisition.pixel_size_nm
+        microscope.pixel_size_nm
+        smlm.pixel_size_nm
+    """
+    if cli_pixel_size_nm is not None:
+        return float(cli_pixel_size_nm)
+
+    candidate_paths = [
+        ["pixel_size_nm"],
+        ["data", "pixel_size_nm"],
+        ["input", "pixel_size_nm"],
+        ["camera", "pixel_size_nm"],
+        ["acquisition", "pixel_size_nm"],
+        ["microscope", "pixel_size_nm"],
+        ["smlm", "pixel_size_nm"],
+    ]
+
+    for keys in candidate_paths:
+        value = get_nested(profile, keys, default=None)
+
+        if value is not None:
+            try:
+                return float(value)
+            except Exception:
+                pass
+
+    return None
+
+
+# =============================================================================
+# Dynamic imports
+# =============================================================================
 
 def get_qc_function() -> Callable[..., Dict[str, Any]]:
     try:
@@ -254,36 +352,28 @@ def get_optional_liteloc_function() -> Tuple[Optional[Callable[..., Any]], str]:
         "run_liteloc",
     ]:
         fn = getattr(module, name, None)
+
         if callable(fn):
             return fn, f"using adapters.liteloc_adapter.{name}"
 
     return None, "No supported LiteLoc adapter function found"
 
 
-def get_optional_converter_function() -> Tuple[Optional[Callable[..., Any]], str]:
+def get_post_inference_function() -> Callable[..., Dict[str, Any]]:
     try:
-        module = importlib.import_module("convert_to_canonical")
-    except ModuleNotFoundError:
-        return None, "post_inference.py not found"
+        from post_inference import run_post_inference
     except Exception as exc:
-        return None, f"convert_to_canonical import failed: {repr(exc)}"
+        raise ImportError(
+            "Could not import run_post_inference from post_inference.py. "
+            "Make sure post_inference.py exists in the project root."
+        ) from exc
 
-    for name in [
-        "convert_one",
-        "convert_liteloc_to_canonical",
-        "convert_to_canonical",
-    ]:
-        fn = getattr(module, name, None)
-        if callable(fn):
-            return fn, f"using convert_to_canonical.{name}"
-
-    return None, "No supported converter function found"
+    return run_post_inference
 
 
-# ---------------------------------------------------------------------
-# Backend and conversion
-# ---------------------------------------------------------------------
-
+# =============================================================================
+# Backend execution
+# =============================================================================
 
 def run_backend_if_available(
     backend_name: str,
@@ -369,141 +459,9 @@ def run_backend_if_available(
         }
 
 
-def convert_if_available(
-    raw_output_path: str,
-    movie_out_dir: Path,
-    profile: Dict[str, Any],
-    source_file: Optional[Path] = None,
-) -> Dict[str, Any]:
-    """
-    Convert backend raw output to canonical localization CSV.
-
-    Supports multiple possible converter signatures:
-        1. convert_liteloc_to_canonical(raw_csv=..., output_csv=..., source_file=...)
-        2. convert_liteloc_to_canonical(input_path=..., out_path=..., profile=...)
-        3. convert_liteloc_to_canonical(raw_output, canonical_path)
-    """
-    if not raw_output_path:
-        return {
-            "canonical_status": "pending_no_raw_output",
-            "canonical_message": "No raw backend output available.",
-            "canonical_output_path": "",
-        }
-
-    raw_output = Path(raw_output_path).expanduser().resolve()
-
-    if not raw_output.exists():
-        return {
-            "canonical_status": "failed_raw_output_missing",
-            "canonical_message": f"Raw output path does not exist: {raw_output}",
-            "canonical_output_path": "",
-        }
-
-    fn, message = get_optional_converter_function()
-
-    if fn is None:
-        return {
-            "canonical_status": "pending_converter_missing",
-            "canonical_message": message,
-            "canonical_output_path": "",
-        }
-
-    canonical_name = "canonical_localizations.csv"
-
-    output_block = profile.get("output", {})
-    if isinstance(output_block, dict):
-        canonical_name = str(
-            output_block.get("canonical_output_name", canonical_name)
-        )
-
-    canonical_path = movie_out_dir / canonical_name
-
-    # -------------------------------------------------------------
-    # Try modern explicit signature first:
-    # convert_liteloc_to_canonical(raw_csv=..., output_csv=..., source_file=...)
-    # -------------------------------------------------------------
-    try:
-        output = fn(
-            raw_csv=raw_output,
-            output_csv=canonical_path,
-            source_file=source_file,
-        )
-
-        if output is not None:
-            canonical_path = Path(output)
-
-        return {
-            "canonical_status": "passed",
-            "canonical_message": message + " with raw_csv/output_csv/source_file signature",
-            "canonical_output_path": str(canonical_path),
-        }
-
-    except TypeError:
-        pass
-
-    except Exception as exc:
-        return {
-            "canonical_status": "failed",
-            "canonical_message": repr(exc),
-            "canonical_output_path": "",
-        }
-
-    # -------------------------------------------------------------
-    # Try older keyword signature:
-    # convert_one(input_path=..., out_path=..., profile=...)
-    # -------------------------------------------------------------
-    try:
-        output = fn(
-            input_path=raw_output,
-            out_path=canonical_path,
-            profile=profile,
-        )
-
-        if output is not None:
-            canonical_path = Path(output)
-
-        return {
-            "canonical_status": "passed",
-            "canonical_message": message + " with input_path/out_path/profile signature",
-            "canonical_output_path": str(canonical_path),
-        }
-
-    except TypeError:
-        pass
-
-    except Exception as exc:
-        return {
-            "canonical_status": "failed",
-            "canonical_message": repr(exc),
-            "canonical_output_path": "",
-        }
-
-    # -------------------------------------------------------------
-    # Try simple positional fallback:
-    # convert_liteloc_to_canonical(raw_output, canonical_path)
-    # -------------------------------------------------------------
-    try:
-        output = fn(raw_output, canonical_path)
-
-        if output is not None:
-            canonical_path = Path(output)
-
-        return {
-            "canonical_status": "passed",
-            "canonical_message": message + " with positional fallback",
-            "canonical_output_path": str(canonical_path),
-        }
-
-    except Exception as exc:
-        return {
-            "canonical_status": "failed",
-            "canonical_message": repr(exc),
-            "canonical_output_path": "",
-        }
-# ---------------------------------------------------------------------
+# =============================================================================
 # Main pipeline
-# ---------------------------------------------------------------------
-
+# =============================================================================
 
 def run_pipeline(
     input_path: Path,
@@ -512,6 +470,16 @@ def run_pipeline(
     backend_override: Optional[str] = None,
     max_files: Optional[int] = None,
     force: bool = False,
+    coord_units: str = "auto",
+    pixel_size_nm: Optional[float] = None,
+    export_smap_enabled: Optional[bool] = None,
+    export_picasso_enabled: Optional[bool] = None,
+    export_napari_enabled: Optional[bool] = None,
+    export_locan_enabled: Optional[bool] = None,
+    default_locprec_nm: float = 20.0,
+    default_lpx_px: float = 1.0,
+    napari_units: str = "nm",
+    locan_units: str = "nm",
 ) -> Dict[str, Any]:
     input_path = input_path.expanduser().resolve()
     out_dir = out_dir.expanduser().resolve()
@@ -524,7 +492,7 @@ def run_pipeline(
         print(
             f"Output directory already exists and is not empty.\n"
             f"Using new numbered output directory:\n"
-            f"{out_dir}\n"
+            f"{display_path(out_dir)}\n"
         )
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -533,6 +501,7 @@ def run_pipeline(
 
     profile = load_profile(profile_path)
     backend_name = get_backend_name(profile, backend_override)
+    resolved_pixel_size_nm = infer_pixel_size_nm(profile, pixel_size_nm)
 
     movies = discover_tiff_movies(input_path)
 
@@ -543,6 +512,7 @@ def run_pipeline(
         raise RuntimeError(f"No TIFF/OME-TIFF files found in: {input_path}")
 
     qc_one_movie = get_qc_function()
+    run_post_inference = get_post_inference_function()
 
     batches_dir = out_dir / "batches"
     batches_dir.mkdir(parents=True, exist_ok=True)
@@ -552,11 +522,14 @@ def run_pipeline(
     print("=" * 70)
     print("SMLM wrapper pipeline")
     print("=" * 70)
-    print(f"Input:   {input_path}")
-    print(f"Output:  {out_dir}")
-    print(f"Profile: {profile_path}")
-    print(f"Backend: {backend_name}")
-    print(f"Movies:  {len(movies)}")
+    print(f"Input:          {display_path(input_path)}")
+    print(f"Output:         {display_path(out_dir)}")
+    print(f"Profile:        {display_path(profile_path)}")
+    print(f"Backend:        {backend_name}")
+    print(f"Movies:         {len(movies)}")
+    print(f"Coord units:    {coord_units}")
+    print(f"Pixel size nm:  {resolved_pixel_size_nm}")
+    print("Review:         external/manual")
     print("=" * 70)
     print()
 
@@ -576,12 +549,15 @@ def run_pipeline(
             "run_dir": str(movie_out_dir),
             "profile_path": str(profile_path),
             "backend_name": backend_name,
+            "coord_units_requested": coord_units,
+            "pixel_size_nm": resolved_pixel_size_nm,
+            "review_mode": "external_manual",
             "created_at": datetime.now().isoformat(timespec="seconds"),
         }
 
-        # -------------------------------------------------------------
+        # -----------------------------------------------------------------
         # QC stage
-        # -------------------------------------------------------------
+        # -----------------------------------------------------------------
 
         try:
             with bench.stage(
@@ -620,9 +596,9 @@ def run_pipeline(
         qc_status = qc_result.get("qc_status", "unknown")
         print(f"    QC: {qc_status}")
 
-        # -------------------------------------------------------------
-        # Backend + canonical stages
-        # -------------------------------------------------------------
+        # -----------------------------------------------------------------
+        # Backend + post-inference stages
+        # -----------------------------------------------------------------
 
         if qc_status != "passed":
             backend_result = {
@@ -634,8 +610,10 @@ def run_pipeline(
 
             canonical_result = {
                 "canonical_status": "skipped_qc_failed",
-                "canonical_message": "QC failed; canonical conversion skipped.",
+                "canonical_message": "QC failed; post-inference skipped.",
                 "canonical_output_path": "",
+                "post_inference_summary": "",
+                "localization_qc": "",
             }
 
             export_result = {
@@ -644,8 +622,8 @@ def run_pipeline(
             }
 
             print("    Backend: skipped_qc_failed")
-            print("    Canonical: skipped_qc_failed")
-            print("    Downstream export: skipped_qc_failed")
+            print("    Post-inference: skipped_qc_failed")
+            print("    Review: external_manual")
 
         else:
             with bench.stage(
@@ -663,40 +641,100 @@ def run_pipeline(
 
             print(f"    Backend: {backend_result.get('backend_status')}")
 
-            with bench.stage(
-                "canonical_conversion",
-                batch_index=index,
-                input_path=backend_result.get("raw_output_path", ""),
-                out_dir=movie_out_dir,
-            ):
-                canonical_result = convert_if_available(
-                    raw_output_path=backend_result.get("raw_output_path", ""),
-                    movie_out_dir=movie_out_dir,
-                    profile=profile,
-                    source_file=movie_path,
-                )
-            print(f"    Canonical: {canonical_result.get('canonical_status')}")
-            if canonical_result.get("canonical_status") == "passed":
-                try:
-                    from export_downstream import export_one
+            raw_output_path = backend_result.get("raw_output_path", "")
 
-                    export_result = export_one(
-                        canonical_path=canonical_result.get("canonical_output_path"),
+            if raw_output_path:
+                try:
+                    with bench.stage(
+                        "post_inference",
+                        batch_index=index,
+                        input_path=raw_output_path,
                         out_dir=movie_out_dir,
-                        profile=profile,
-                    )
+                    ):
+                        post_summary = run_post_inference(
+                            input_path=raw_output_path,
+                            out_dir=movie_out_dir,
+                            profile=profile,
+                            backend_name=backend_name,
+                            source_file=str(movie_path),
+                            coord_units=coord_units,
+                            pixel_size_nm=resolved_pixel_size_nm,
+                            default_locprec_nm=default_locprec_nm,
+                            default_lpx_px=default_lpx_px,
+                            napari_units=napari_units,
+                            locan_units=locan_units,
+                            export_smap_enabled=export_smap_enabled,
+                            export_picasso_enabled=export_picasso_enabled,
+                            export_napari_enabled=export_napari_enabled,
+                            export_locan_enabled=export_locan_enabled,
+                        )
+
+                    canonical_output_path = post_summary.get("canonical_csv", "")
+
+                    canonical_result = {
+                        "canonical_status": "passed" if canonical_output_path else "failed",
+                        "canonical_message": "post_inference.run_post_inference completed",
+                        "canonical_output_path": canonical_output_path,
+                        "post_inference_summary": post_summary.get(
+                            "post_inference_summary",
+                            str(movie_out_dir / "post_inference_summary.json"),
+                        ),
+                        "localization_qc": post_summary.get("localization_qc", ""),
+                    }
+
+                    export_result = {
+                        "status": post_summary.get("status", "unknown"),
+                        "exports": post_summary.get("exports", {}),
+                        "plots": post_summary.get("plots", {}),
+                        "quality_flags": post_summary.get("quality_flags", []),
+                        "coord_units_detected": post_summary.get(
+                            "coord_units_detected",
+                            coord_units,
+                        ),
+                        "pixel_size_nm": post_summary.get(
+                            "pixel_size_nm",
+                            resolved_pixel_size_nm,
+                        ),
+                    }
 
                 except Exception as exc:
+                    post_summary = {}
+
+                    canonical_result = {
+                        "canonical_status": "failed",
+                        "canonical_message": repr(exc),
+                        "canonical_output_path": "",
+                        "post_inference_summary": "",
+                        "localization_qc": "",
+                    }
+
                     export_result = {
                         "status": "failed",
                         "error": repr(exc),
                     }
+
             else:
-                export_result = {
-                    "status": "skipped_no_canonical",
+                post_summary = {}
+
+                canonical_result = {
+                    "canonical_status": "skipped_no_raw_output",
+                    "canonical_message": "No raw backend output available for post-inference.",
+                    "canonical_output_path": "",
+                    "post_inference_summary": "",
+                    "localization_qc": "",
                 }
 
-            print(f"    Downstream export: {export_result.get('status')}")
+                export_result = {
+                    "status": "skipped_no_raw_output",
+                }
+
+            print(f"    Post-inference: {export_result.get('status')}")
+            print("    Review: external_manual")
+
+        # -----------------------------------------------------------------
+        # Manifest row
+        # -----------------------------------------------------------------
+
         row: Dict[str, Any] = {}
         row.update(base_row)
 
@@ -713,14 +751,27 @@ def run_pipeline(
 
         row.update(backend_result)
         row.update(canonical_result)
+
+        row["post_inference_status"] = export_result.get("status", "")
         row["downstream_export_status"] = export_result.get("status", "")
         row["downstream_export_result"] = export_result
+        row["post_inference_summary"] = canonical_result.get("post_inference_summary", "")
+        row["localization_qc"] = canonical_result.get("localization_qc", "")
+        row["review_status"] = "external_manual"
+        row["review_result"] = {
+            "status": "external_manual",
+            "message": (
+                "napari/Locan review is not run inside run_pipeline.py. "
+                "Use napari_locan_review.py separately in napari_locan_env."
+            ),
+        }
+
         rows.append(row)
         print()
 
-    # -----------------------------------------------------------------
-    # Save manifests and summary
-    # -----------------------------------------------------------------
+    # =========================================================================
+    # Save manifests and benchmark
+    # =========================================================================
 
     manifest_csv = out_dir / "batch_manifest.csv"
     manifest_json = out_dir / "batch_manifest.json"
@@ -731,9 +782,9 @@ def run_pipeline(
 
     benchmark_summary = bench.finalize()
 
-    # -----------------------------------------------------------------
+    # =========================================================================
     # Create top-level combined exports
-    # -----------------------------------------------------------------
+    # =========================================================================
 
     try:
         from combine_run_outputs import combine_run_outputs
@@ -748,25 +799,32 @@ def run_pipeline(
             "outputs": {},
         }
 
-    # -----------------------------------------------------------------
-    # Save manifests and summary
-    # -----------------------------------------------------------------
+    # =========================================================================
+    # Save summary
+    # =========================================================================
 
     summary = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "input": str(input_path),
+        "requested_out_dir": str(requested_out_dir),
         "out_dir": str(out_dir),
         "profile_path": str(profile_path),
         "backend_name": backend_name,
+        "coord_units_requested": coord_units,
+        "pixel_size_nm": resolved_pixel_size_nm,
+        "review_mode": "external_manual",
         "n_movies": len(rows),
+
         "qc_passed": sum(row.get("qc_status") == "passed" for row in rows),
         "qc_failed": sum(row.get("qc_status") == "failed" for row in rows),
+
         "backend_passed": sum(row.get("backend_status") == "passed" for row in rows),
         "backend_failed": sum(row.get("backend_status") == "failed" for row in rows),
         "backend_pending_adapter_missing": sum(
             row.get("backend_status") == "pending_adapter_missing"
             for row in rows
         ),
+
         "canonical_passed": sum(
             row.get("canonical_status") == "passed"
             for row in rows
@@ -775,6 +833,16 @@ def run_pipeline(
             row.get("canonical_status") == "failed"
             for row in rows
         ),
+
+        "post_inference_passed": sum(
+            row.get("post_inference_status") in {"passed", "warning"}
+            for row in rows
+        ),
+        "post_inference_failed": sum(
+            row.get("post_inference_status") == "failed"
+            for row in rows
+        ),
+
         "manifest_csv": str(manifest_csv),
         "manifest_json": str(manifest_json),
         "summary_json": str(summary_json),
@@ -782,13 +850,11 @@ def run_pipeline(
         "combined_exports": combined_exports,
     }
 
-    # Write summary once before report generation.
-    # The report generator reads run_summary.json.
     write_json(summary, summary_json)
 
-    # -----------------------------------------------------------------
+    # =========================================================================
     # Generate supervisor-friendly report
-    # -----------------------------------------------------------------
+    # =========================================================================
 
     try:
         from generate_run_report import generate_run_report
@@ -808,46 +874,80 @@ def run_pipeline(
             "error": repr(exc),
         }
 
-    # Write final summary again after report generation.
     write_json(summary, summary_json)
 
-    # -----------------------------------------------------------------
+    # =========================================================================
     # Final terminal output
-    # -----------------------------------------------------------------
+    # =========================================================================
 
     print("=" * 70)
     print("Pipeline complete")
     print("=" * 70)
-    print(f"Manifest CSV:      {manifest_csv}")
-    print(f"Manifest JSON:     {manifest_json}")
-    print(f"Summary JSON:      {summary_json}")
-    print(f"Benchmark CSV:     {benchmark_summary['benchmark_csv']}")
-    print(f"Benchmark JSON:    {benchmark_summary['benchmark_json']}")
+
+    print(f"Manifest CSV:      {display_path(manifest_csv)}")
+    print(f"Manifest JSON:     {display_path(manifest_json)}")
+    print(f"Summary JSON:      {display_path(summary_json)}")
+
+    if isinstance(benchmark_summary, dict):
+        benchmark_csv = benchmark_summary.get("benchmark_csv", "")
+        benchmark_json = benchmark_summary.get("benchmark_json", "")
+
+        print(f"Benchmark CSV:     {display_path(benchmark_csv) if benchmark_csv else ''}")
+        print(f"Benchmark JSON:    {display_path(benchmark_json) if benchmark_json else ''}")
+    else:
+        print("Benchmark:         unavailable")
 
     report = summary.get("report", {})
 
     if report.get("status") == "passed":
-        print(f"Report Markdown:   {report.get('markdown_report', '')}")
-        print(f"Report HTML:       {report.get('html_report', '')}")
-        print(f"Report assets:     {report.get('assets_dir', '')}")
+        markdown_report = report.get("markdown_report", "")
+        html_report = report.get("html_report", "")
+        assets_dir = report.get("assets_dir", "")
+
+        print(f"Report Markdown:   {display_path(markdown_report) if markdown_report else ''}")
+        print(f"Report HTML:       {display_path(html_report) if html_report else ''}")
+        print(f"Report assets:     {display_path(assets_dir) if assets_dir else ''}")
     else:
         print("Report generation: failed")
         print(f"Report error:      {report.get('error', '')}")
 
-    combined_outputs = combined_exports.get("outputs", {})
+    combined_exports_safe = summary.get("combined_exports", {})
+    combined_outputs = combined_exports_safe.get("outputs", {})
 
     if combined_outputs:
-        combined_dir = combined_exports.get("combined_dir", "")
-        canonical_all = combined_outputs.get("canonical_all_localizations", "")
-        napari_all = combined_outputs.get("napari_all_points", "")
-        export_index = combined_outputs.get("downstream_exports_index", "")
-        combined_report = combined_outputs.get("combined_export_report", "")
+        combined_dir = combined_exports_safe.get("combined_dir", "")
+        print(f"Combined exports:  {display_path(combined_dir) if combined_dir else ''}")
 
-        print(f"Combined exports:  {combined_dir}")
-        print(f"Canonical all:     {canonical_all}")
-        print(f"Napari all:        {napari_all}")
-        print(f"Export index:      {export_index}")
-        print(f"Combined report:   {combined_report}")
+        known_keys = [
+            "canonical_all_localizations",
+            "smap_all_localizations",
+            "picasso_all_localizations",
+            "napari_all_points",
+            "locan_all_localizations",
+            "downstream_exports_index",
+            "combined_export_report",
+        ]
+
+        printed = set()
+
+        for key in known_keys:
+            value = combined_outputs.get(key, "")
+
+            if value:
+                label = key.replace("_", " ").title()
+                print(f"{label + ':':<25} {display_path(value)}")
+                printed.add(key)
+
+        for key, value in combined_outputs.items():
+            if key in printed:
+                continue
+
+            label = key.replace("_", " ").title()
+
+            if isinstance(value, str) and value:
+                print(f"{label + ':':<25} {display_path(value)}")
+            else:
+                print(f"{label + ':':<25} {value}")
     else:
         print("Combined exports:  none")
 
@@ -855,14 +955,17 @@ def run_pipeline(
 
     return summary
 
-# ---------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------
 
+# =============================================================================
+# CLI
+# =============================================================================
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="SMLM wrapper pipeline with automatic QC, backend, canonical conversion, and runtime benchmark."
+        description=(
+            "SMLM wrapper pipeline with automatic QC, LiteLoc backend, "
+            "post-inference adapted exports, combined outputs, and runtime benchmark."
+        )
     )
 
     parser.add_argument(
@@ -903,15 +1006,108 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
-        "--review-locan",
-        action="store_true",
-        help="Generate Locan-style downstream review after post-inference.",
+        "--coord-units",
+        choices=["auto", "nm", "pixel"],
+        default="auto",
+        help="Units of localization coordinates after inference.",
     )
 
     parser.add_argument(
-        "--open-napari",
+        "--pixel-size-nm",
+        type=float,
+        default=None,
+        help="Camera pixel size in nm for nm/pixel downstream conversion.",
+    )
+
+    parser.add_argument(
+        "--default-locprec-nm",
+        type=float,
+        default=20.0,
+        help="Default localization precision in nm for SMAP export when lpx/lpy are missing.",
+    )
+
+    parser.add_argument(
+        "--default-lpx-px",
+        type=float,
+        default=1.0,
+        help="Default localization precision in pixels for Picasso export when lpx/lpy are missing.",
+    )
+
+    parser.add_argument(
+        "--napari-units",
+        choices=["nm", "pixel"],
+        default="nm",
+        help="Coordinate units written to napari CSV export from post_inference.",
+    )
+
+    parser.add_argument(
+        "--locan-units",
+        choices=["nm", "pixel"],
+        default="nm",
+        help="Coordinate units written to Locan CSV export from post_inference.",
+    )
+
+    smap_group = parser.add_mutually_exclusive_group()
+    smap_group.add_argument(
+        "--export-smap",
+        dest="export_smap",
         action="store_true",
-        help="Open napari viewer after post-inference. GUI/blocking.",
+        help="Force SMAP-adapted CSV export.",
+    )
+    smap_group.add_argument(
+        "--no-smap",
+        dest="export_smap",
+        action="store_false",
+        help="Disable SMAP-adapted CSV export.",
+    )
+
+    picasso_group = parser.add_mutually_exclusive_group()
+    picasso_group.add_argument(
+        "--export-picasso",
+        dest="export_picasso",
+        action="store_true",
+        help="Force Picasso-adapted CSV export.",
+    )
+    picasso_group.add_argument(
+        "--no-picasso",
+        dest="export_picasso",
+        action="store_false",
+        help="Disable Picasso-adapted CSV export.",
+    )
+
+    napari_group = parser.add_mutually_exclusive_group()
+    napari_group.add_argument(
+        "--export-napari",
+        dest="export_napari",
+        action="store_true",
+        help="Force napari points CSV export.",
+    )
+    napari_group.add_argument(
+        "--no-napari",
+        dest="export_napari",
+        action="store_false",
+        help="Disable napari points CSV export.",
+    )
+
+    locan_group = parser.add_mutually_exclusive_group()
+    locan_group.add_argument(
+        "--export-locan",
+        dest="export_locan",
+        action="store_true",
+        help="Force Locan-style CSV export.",
+    )
+    locan_group.add_argument(
+        "--no-locan",
+        dest="export_locan",
+        action="store_false",
+        help="Disable Locan-style CSV export.",
+    )
+
+    parser.set_defaults(
+        export_smap=None,
+        export_picasso=None,
+        export_napari=None,
+        export_locan=None,
     )
 
     return parser
@@ -929,6 +1125,16 @@ def main() -> None:
             backend_override=args.backend,
             max_files=args.max_files,
             force=args.force,
+            coord_units=args.coord_units,
+            pixel_size_nm=args.pixel_size_nm,
+            export_smap_enabled=args.export_smap,
+            export_picasso_enabled=args.export_picasso,
+            export_napari_enabled=args.export_napari,
+            export_locan_enabled=args.export_locan,
+            default_locprec_nm=args.default_locprec_nm,
+            default_lpx_px=args.default_lpx_px,
+            napari_units=args.napari_units,
+            locan_units=args.locan_units,
         )
 
     except Exception as exc:

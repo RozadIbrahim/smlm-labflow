@@ -1,0 +1,85 @@
+name: liteloc_env
+
+channels:
+  - conda-forge
+  - turagalab
+  - nodefaults
+
+dependencies:
+  - python=3.9.21
+  - pip
+  - setuptools
+  - wheel
+  - git
+  - spline=0.10.0
+
+  - pip:
+      - -f https://download.pytorch.org/whl/torch_stable.html
+
+      # PyTorch / CUDA
+      - torch==2.2.2+cu121
+      - torchvision==0.17.2+cu121
+      - torchaudio==2.2.2+cu121
+      - nvidia-cublas-cu12==12.1.3.1
+      - nvidia-cuda-cupti-cu12==12.1.105
+      - nvidia-cuda-nvrtc-cu12==12.1.105
+      - nvidia-cuda-runtime-cu12==12.1.105
+      - nvidia-cudnn-cu12==8.9.2.26
+      - nvidia-cufft-cu12==11.0.2.54
+      - nvidia-curand-cu12==10.3.2.106
+      - nvidia-cusolver-cu12==11.4.5.107
+      - nvidia-cusparse-cu12==12.1.0.106
+      - nvidia-nccl-cu12==2.19.3
+      - nvidia-nvtx-cu12==12.1.105
+      - nvidia-nvjitlink-cu12==12.9.86
+      - triton==2.2.0
+
+      # LiteLoc / scientific stack
+      - numpy==1.24.4
+      - scipy==1.13.1
+      - pandas==2.3.3
+      - matplotlib==3.9.4
+      - scikit-image==0.24.0
+      - tifffile==2023.7.10
+      - imageio==2.37.2
+      - pillow==11.3.0
+      - h5py==3.14.0
+      - h5py-wrapper==1.1.0
+      - hdfdict==0.3.1
+
+      # LiteLoc utilities
+      - natsort==8.4.0
+      - omegaconf==2.3.0
+      - PyYAML==5.4.1
+      - RecursiveNamespace==0.2.2
+      - thop==0.1.1.post2209072238
+      - Deprecated==1.3.1
+      - dotted-dict==1.1.3
+
+      # Runtime dependencies observed in working env
+      - antlr4-python3-runtime==4.9.3
+      - contourpy==1.3.0
+      - cycler==0.12.1
+      - filelock==3.19.1
+      - fonttools==4.60.2
+      - fsspec==2025.10.0
+      - future==1.0.0
+      - importlib-resources==6.5.2
+      - jinja2==3.1.6
+      - kiwisolver==1.4.7
+      - lazy-loader==0.5
+      - MarkupSafe==3.0.3
+      - mpmath==1.3.0
+      - networkx==3.2.1
+      - packaging==26.2
+      - pyparsing==3.3.2
+      - pytest-runner==6.0.1
+      - python-dateutil==2.9.0.post0
+      - pytz==2026.1.post1
+      - six==1.17.0
+      - sympy==1.14.0
+      - tqdm==4.67.3
+      - typing-extensions==4.15.0
+      - tzdata==2026.2
+      - wrapt==2.1.2
+      - zipp==3.23.1
