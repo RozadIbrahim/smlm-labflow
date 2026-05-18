@@ -1,0 +1,22 @@
+# config/local_paths.yaml
+# Machine-specific LiteLoc backend ports only.
+# Paths may be absolute or relative to liteloc.root.
+# Edit once per lab computer.
+
+
+liteloc:
+  root: null
+
+
+  ports:
+    # LiteLoc Python PSF calibration workflow.
+    # Usually the Demo3 calibration workflow.
+    calibrate: "demo/demo3_calibrate_psf/demo3_psf_calibration.py"
+
+    # LiteLoc training backend port.
+    # Prefer the real training module/entrypoint used by your adapter.
+    train: "network/loc_model.py"
+
+    # LiteLoc inference backend port.
+    # Prefer the real inference module/entrypoint used by your adapter.
+    infer: "network/multi_process.py"
