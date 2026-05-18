@@ -1,22 +1,39 @@
-# config/local_paths.yaml
-# Machine-specific LiteLoc backend ports only.
-# Paths may be absolute or relative to liteloc.root.
-# Edit once per lab computer.
-
-
+# adapters/backend_paths.yml
 liteloc:
-  root: null
+  root: /common_data/conda_envs/LiteLoc
 
+  modules:
+    vector_calibration: utils/vectorpsf_fit.py
+    spline_calibration_io: spline_psf/calibration_io.py
+    train: network/loc_model.py
+    infer: network/multi_process.py
 
-  ports:
-    # LiteLoc Python PSF calibration workflow.
-    # Usually the Demo3 calibration workflow.
-    calibrate: "demo/demo3_calibrate_psf/demo3_psf_calibration.py"
+  functions:
+    vector_calibration: beads_psf_calibrate
+    spline_loader_class: SMAPSplineCoefficient
+    train_class: LocModel
+    infer_class: CompetitiveSmlmDataAnalyzer_multi_producer
 
-    # LiteLoc training backend port.
-    # Prefer the real training module/entrypoint used by your adapter.
-    train: "network/loc_model.py"
+  execution:
+    vector_calibration: function
+    spline_calibration_io: module
+    train: module
+    infer: module
 
-    # LiteLoc inference backend port.
-    # Prefer the real inference module/entrypoint used by your adapter.
-    infer: "network/multi_process.py"
+  quality_control:
+    run_after_calibrate: true
+    run_after_train: true
+    run_after_infer: true
+
+    calibration_metrics:
+      enabled: true
+      psf_fit_diagnostics: true
+
+    training_metrics:
+      enabled: true
+      crlb_rmse: true
+
+    localization_metrics:
+      enabled: true
+      grid_artifact_index: true
+      fft_grid_spectrum: true

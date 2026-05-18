@@ -57,7 +57,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
-import numpy as np
 import pandas as pd
 
 try:
@@ -122,53 +121,145 @@ COLUMN_ALIASES = {
     "input_name": ["input_name", "movie_name", "file_name", "filename", "name"],
     "input_path": ["input_path", "movie_path", "file_path", "filepath", "path"],
     "frame": [
-        "frame", "frame_idx", "frame_index", "frame_id",
-        "nframe", "t", "time", "image", "image_id", "image_index",
-        "img", "img_index", "slice", "slice_idx",
+        "frame",
+        "frame_idx",
+        "frame_index",
+        "frame_id",
+        "nframe",
+        "t",
+        "time",
+        "image",
+        "image_id",
+        "image_index",
+        "img",
+        "img_index",
+        "slice",
+        "slice_idx",
     ],
     "x": [
-        "x", "x_nm", "x[nm]", "xnm", "x_nm_",
-        "x_position", "x_pos", "xpos", "x_est", "xrec",
-        "xpix", "x_pix", "x_pixel", "x_px",
-        "xcoord", "x_coordinate", "xlocal", "x_local",
+        "x",
+        "x_nm",
+        "x[nm]",
+        "xnm",
+        "x_nm_",
+        "x_position",
+        "x_pos",
+        "xpos",
+        "x_est",
+        "xrec",
+        "xpix",
+        "x_pix",
+        "x_pixel",
+        "x_px",
+        "xcoord",
+        "x_coordinate",
+        "xlocal",
+        "x_local",
     ],
     "y": [
-        "y", "y_nm", "y[nm]", "ynm", "y_nm_",
-        "y_position", "y_pos", "ypos", "y_est", "yrec",
-        "ypix", "y_pix", "y_pixel", "y_px",
-        "ycoord", "y_coordinate", "ylocal", "y_local",
+        "y",
+        "y_nm",
+        "y[nm]",
+        "ynm",
+        "y_nm_",
+        "y_position",
+        "y_pos",
+        "ypos",
+        "y_est",
+        "yrec",
+        "ypix",
+        "y_pix",
+        "y_pixel",
+        "y_px",
+        "ycoord",
+        "y_coordinate",
+        "ylocal",
+        "y_local",
     ],
     "z": [
-        "z", "z_nm", "z[nm]", "znm", "z_nm_",
-        "z_position", "z_pos", "zpos", "z_est", "zrec",
-        "zcoord", "z_coordinate", "zlocal", "z_local",
+        "z",
+        "z_nm",
+        "z[nm]",
+        "znm",
+        "z_nm_",
+        "z_position",
+        "z_pos",
+        "zpos",
+        "z_est",
+        "zrec",
+        "zcoord",
+        "z_coordinate",
+        "zlocal",
+        "z_local",
     ],
     "photons": [
-        "photons", "photon", "n_photons", "nphotons",
-        "intensity", "amp", "amplitude", "signal",
-        "brightness", "height", "i", "phot",
+        "photons",
+        "photon",
+        "n_photons",
+        "nphotons",
+        "intensity",
+        "amp",
+        "amplitude",
+        "signal",
+        "brightness",
+        "height",
+        "i",
+        "phot",
     ],
     "background": [
-        "background", "bg", "bkg", "bkgd", "backg",
-        "offset", "noise", "baseline",
+        "background",
+        "bg",
+        "bkg",
+        "bkgd",
+        "backg",
+        "offset",
+        "noise",
+        "baseline",
     ],
     "confidence": [
-        "confidence", "prob", "probability", "score",
-        "detection_score", "pred_score", "p", "likelihood", "conf",
+        "confidence",
+        "prob",
+        "probability",
+        "score",
+        "detection_score",
+        "pred_score",
+        "p",
+        "likelihood",
+        "conf",
     ],
     "lpx": [
-        "lpx", "sigma_x", "sx", "x_sigma", "x_precision",
-        "x_precision_nm", "uncertainty_x", "loc_precision_x",
-        "locprecnm", "crlb_x",
+        "lpx",
+        "sigma_x",
+        "sx",
+        "x_sigma",
+        "x_precision",
+        "x_precision_nm",
+        "uncertainty_x",
+        "loc_precision_x",
+        "locprecnm",
+        "crlb_x",
     ],
     "lpy": [
-        "lpy", "sigma_y", "sy", "y_sigma", "y_precision",
-        "y_precision_nm", "uncertainty_y", "loc_precision_y",
-        "locprecnm", "crlb_y",
+        "lpy",
+        "sigma_y",
+        "sy",
+        "y_sigma",
+        "y_precision",
+        "y_precision_nm",
+        "uncertainty_y",
+        "loc_precision_y",
+        "locprecnm",
+        "crlb_y",
     ],
     "lpz": [
-        "lpz", "sigma_z", "sz", "z_sigma", "z_precision",
-        "z_precision_nm", "uncertainty_z", "loc_precision_z",
+        "lpz",
+        "sigma_z",
+        "sz",
+        "z_sigma",
+        "z_precision",
+        "z_precision_nm",
+        "uncertainty_z",
+        "loc_precision_z",
         "crlb_z",
     ],
 }
@@ -177,6 +268,7 @@ COLUMN_ALIASES = {
 # =============================================================================
 # Utilities
 # =============================================================================
+
 
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
@@ -233,7 +325,9 @@ def get_nested(data: Dict[str, Any], keys: list[str], default: Any = None) -> An
     return default if cur is None else cur
 
 
-def infer_pixel_size_nm(profile: Dict[str, Any], cli_pixel_size_nm: Optional[float]) -> Optional[float]:
+def infer_pixel_size_nm(
+    profile: Dict[str, Any], cli_pixel_size_nm: Optional[float]
+) -> Optional[float]:
     if cli_pixel_size_nm is not None:
         return float(cli_pixel_size_nm)
 
@@ -403,6 +497,7 @@ def get_precision_series(
 # Canonical conversion
 # =============================================================================
 
+
 def convert_inference_to_canonical(
     input_path: str | Path,
     out_dir: str | Path,
@@ -448,7 +543,9 @@ def convert_inference_to_canonical(
 
         if canonical_col == "source_file":
             canonical[canonical_col] = source_file or str(input_path)
-            conversion_report["column_mapping"][canonical_col] = "__constant_source_file__"
+            conversion_report["column_mapping"][canonical_col] = (
+                "__constant_source_file__"
+            )
             continue
 
         input_col = find_column(input_df, canonical_col)
@@ -503,7 +600,8 @@ def convert_inference_to_canonical(
     conversion_report["canonical_columns_written"] = list(canonical.columns)
 
     required_missing = [
-        col for col in ["frame", "x", "y"]
+        col
+        for col in ["frame", "x", "y"]
         if col in conversion_report["missing_columns"]
     ]
 
@@ -525,6 +623,7 @@ def convert_inference_to_canonical(
 # =============================================================================
 # QC
 # =============================================================================
+
 
 def numeric_summary(series: pd.Series) -> Dict[str, Any]:
     values = pd.to_numeric(series, errors="coerce")
@@ -561,57 +660,69 @@ def build_quality_flags(
     flags: list[Dict[str, Any]] = []
 
     if len(canonical) == 0:
-        flags.append({
-            "level": "error",
-            "code": "EMPTY_LOCALIZATION_TABLE",
-            "message": "Canonical localization table contains zero rows.",
-        })
+        flags.append(
+            {
+                "level": "error",
+                "code": "EMPTY_LOCALIZATION_TABLE",
+                "message": "Canonical localization table contains zero rows.",
+            }
+        )
         return flags
 
     for col in ["x", "y"]:
         if col not in canonical.columns or canonical[col].dropna().empty:
-            flags.append({
-                "level": "error",
-                "code": f"MISSING_{col.upper()}",
-                "message": f"Column {col} is missing or fully empty.",
-            })
+            flags.append(
+                {
+                    "level": "error",
+                    "code": f"MISSING_{col.upper()}",
+                    "message": f"Column {col} is missing or fully empty.",
+                }
+            )
 
     if "frame" in canonical.columns and canonical["frame"].dropna().empty:
-        flags.append({
-            "level": "warning",
-            "code": "MISSING_FRAME",
-            "message": "Frame column is missing or empty. Temporal QC will be limited.",
-        })
+        flags.append(
+            {
+                "level": "warning",
+                "code": "MISSING_FRAME",
+                "message": "Frame column is missing or empty. Temporal QC will be limited.",
+            }
+        )
 
     if coord_units == "nm" and pixel_size_nm is None:
-        flags.append({
-            "level": "warning",
-            "code": "MISSING_PIXEL_SIZE_FOR_PIXEL_EXPORTS",
-            "message": (
-                "Coordinates look like nm but pixel_size_nm is missing. "
-                "Picasso pixel export cannot be physically correct without it."
-            ),
-        })
+        flags.append(
+            {
+                "level": "warning",
+                "code": "MISSING_PIXEL_SIZE_FOR_PIXEL_EXPORTS",
+                "message": (
+                    "Coordinates look like nm but pixel_size_nm is missing. "
+                    "Picasso pixel export cannot be physically correct without it."
+                ),
+            }
+        )
 
     if "confidence" in canonical.columns:
         conf = pd.to_numeric(canonical["confidence"], errors="coerce").dropna()
 
         if len(conf) > 0 and conf.max() > 1.5:
-            flags.append({
-                "level": "info",
-                "code": "CONFIDENCE_NOT_PROBABILITY_SCALE",
-                "message": "Confidence values exceed 1. This may be a score, not a probability.",
-            })
+            flags.append(
+                {
+                    "level": "info",
+                    "code": "CONFIDENCE_NOT_PROBABILITY_SCALE",
+                    "message": "Confidence values exceed 1. This may be a score, not a probability.",
+                }
+            )
 
     if "background" in canonical.columns:
         bg = pd.to_numeric(canonical["background"], errors="coerce").dropna()
 
         if len(bg) == 0:
-            flags.append({
-                "level": "info",
-                "code": "BACKGROUND_MISSING",
-                "message": "Background column is empty. Downstream exports will use 0 where needed.",
-            })
+            flags.append(
+                {
+                    "level": "info",
+                    "code": "BACKGROUND_MISSING",
+                    "message": "Background column is empty. Downstream exports will use 0 where needed.",
+                }
+            )
 
     return flags
 
@@ -685,6 +796,7 @@ def compute_localization_qc(
 # Plots
 # =============================================================================
 
+
 def save_empty_plot(out_path: Path, title: str, message: str) -> None:
     plt.figure(figsize=(7, 4))
     plt.text(0.5, 0.5, message, ha="center", va="center")
@@ -695,7 +807,9 @@ def save_empty_plot(out_path: Path, title: str, message: str) -> None:
     plt.close()
 
 
-def plot_xy_preview(canonical: pd.DataFrame, out_path: Path, max_points: int = 200_000) -> None:
+def plot_xy_preview(
+    canonical: pd.DataFrame, out_path: Path, max_points: int = 200_000
+) -> None:
     if not {"x", "y"}.issubset(canonical.columns):
         save_empty_plot(out_path, "Localization XY preview", "Missing x/y columns")
         return
@@ -703,7 +817,9 @@ def plot_xy_preview(canonical: pd.DataFrame, out_path: Path, max_points: int = 2
     df = canonical[["x", "y"]].dropna()
 
     if len(df) == 0:
-        save_empty_plot(out_path, "Localization XY preview", "No valid x/y localizations")
+        save_empty_plot(
+            out_path, "Localization XY preview", "No valid x/y localizations"
+        )
         return
 
     if len(df) > max_points:
@@ -823,6 +939,7 @@ def generate_qc_plots(canonical: pd.DataFrame, out_dir: Path) -> Dict[str, str]:
 # Downstream export adapters
 # =============================================================================
 
+
 def export_smap(
     canonical: pd.DataFrame,
     out_path: Path,
@@ -853,9 +970,7 @@ def export_smap(
     df = pd.DataFrame()
 
     df["frame"] = (
-        canonical["frame"].fillna(0).astype(int)
-        if "frame" in canonical.columns
-        else 0
+        canonical["frame"].fillna(0).astype(int) if "frame" in canonical.columns else 0
     )
 
     df["xnm"] = get_axis_series(canonical, "x", "nm", coord_units, pixel_size_nm)
@@ -950,9 +1065,7 @@ def export_picasso(
     df = pd.DataFrame()
 
     df["frame"] = (
-        canonical["frame"].fillna(0).astype(int)
-        if "frame" in canonical.columns
-        else 0
+        canonical["frame"].fillna(0).astype(int) if "frame" in canonical.columns else 0
     )
 
     df["x"] = get_axis_series(canonical, "x", "pixel", coord_units, pixel_size_nm)
@@ -1057,15 +1170,25 @@ def export_napari_points(
     df = pd.DataFrame()
 
     if has_z:
-        df["axis_0"] = get_axis_series(canonical, "z", target_units, coord_units, pixel_size_nm)
-        df["axis_1"] = get_axis_series(canonical, "y", target_units, coord_units, pixel_size_nm)
-        df["axis_2"] = get_axis_series(canonical, "x", target_units, coord_units, pixel_size_nm)
+        df["axis_0"] = get_axis_series(
+            canonical, "z", target_units, coord_units, pixel_size_nm
+        )
+        df["axis_1"] = get_axis_series(
+            canonical, "y", target_units, coord_units, pixel_size_nm
+        )
+        df["axis_2"] = get_axis_series(
+            canonical, "x", target_units, coord_units, pixel_size_nm
+        )
         df["axis_0_name"] = "z"
         df["axis_1_name"] = "y"
         df["axis_2_name"] = "x"
     else:
-        df["axis_0"] = get_axis_series(canonical, "y", target_units, coord_units, pixel_size_nm)
-        df["axis_1"] = get_axis_series(canonical, "x", target_units, coord_units, pixel_size_nm)
+        df["axis_0"] = get_axis_series(
+            canonical, "y", target_units, coord_units, pixel_size_nm
+        )
+        df["axis_1"] = get_axis_series(
+            canonical, "x", target_units, coord_units, pixel_size_nm
+        )
         df["axis_0_name"] = "y"
         df["axis_1_name"] = "x"
 
@@ -1090,7 +1213,7 @@ def export_napari_points(
     df.to_csv(out_path, index=False)
 
     helper_path = out_path.parent / "load_napari_points_example.py"
-    helper_code = f'''\
+    helper_code = f"""\
 import pandas as pd
 import napari
 
@@ -1108,7 +1231,7 @@ viewer.add_points(
     name="SMLM localizations"
 )
 napari.run()
-'''
+"""
     helper_path.write_text(helper_code, encoding="utf-8")
 
     return {
@@ -1147,11 +1270,17 @@ def export_locan(
 
     df = pd.DataFrame()
 
-    df["position_x"] = get_axis_series(canonical, "x", target_units, coord_units, pixel_size_nm)
-    df["position_y"] = get_axis_series(canonical, "y", target_units, coord_units, pixel_size_nm)
+    df["position_x"] = get_axis_series(
+        canonical, "x", target_units, coord_units, pixel_size_nm
+    )
+    df["position_y"] = get_axis_series(
+        canonical, "y", target_units, coord_units, pixel_size_nm
+    )
 
     if "z" in canonical.columns and canonical["z"].notna().any():
-        df["position_z"] = get_axis_series(canonical, "z", target_units, coord_units, pixel_size_nm)
+        df["position_z"] = get_axis_series(
+            canonical, "z", target_units, coord_units, pixel_size_nm
+        )
 
     if "frame" in canonical.columns:
         df["frame"] = canonical["frame"]
@@ -1307,6 +1436,7 @@ def run_exports(
 # Main runner
 # =============================================================================
 
+
 def run_post_inference(
     input_path: str | Path,
     out_dir: str | Path,
@@ -1386,7 +1516,9 @@ def run_post_inference(
         "out_dir": str(out_dir),
         "backend": backend_name,
         "canonical_csv": str(canonical_path),
-        "canonical_conversion_report": str(out_dir / "canonical_conversion_report.json"),
+        "canonical_conversion_report": str(
+            out_dir / "canonical_conversion_report.json"
+        ),
         "localization_qc": str(qc_path),
         "post_inference_summary": str(out_dir / "post_inference_summary.json"),
         "coord_units_detected": resolved_coord_units,
@@ -1406,6 +1538,7 @@ def run_post_inference(
 # =============================================================================
 # CLI
 # =============================================================================
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -1503,8 +1636,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--no-smap", action="store_true", help="Disable SMAP export.")
-    parser.add_argument("--no-picasso", action="store_true", help="Disable Picasso export.")
-    parser.add_argument("--no-napari", action="store_true", help="Disable napari export.")
+    parser.add_argument(
+        "--no-picasso", action="store_true", help="Disable Picasso export."
+    )
+    parser.add_argument(
+        "--no-napari", action="store_true", help="Disable napari export."
+    )
     parser.add_argument("--no-locan", action="store_true", help="Disable Locan export.")
 
     return parser.parse_args()

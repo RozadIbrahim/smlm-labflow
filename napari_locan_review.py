@@ -114,6 +114,7 @@ import matplotlib.pyplot as plt
 # JSON-safe utilities
 # =============================================================================
 
+
 def make_json_safe(obj: Any) -> Any:
     """
     Recursively convert NumPy/pandas/path objects into JSON-safe Python types.
@@ -200,6 +201,7 @@ def display_path(path: Path | str | None) -> str:
 # File discovery and table loading
 # =============================================================================
 
+
 def read_csv_checked(path: Path) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"CSV not found: {path}")
@@ -239,15 +241,12 @@ def find_default_localization_file(input_dir: Path) -> Path:
         input_dir / "exports" / "napari" / "napari_points.csv",
         input_dir / "canonical_localizations.csv",
         input_dir / "exports" / "generic" / "smlm_generic_localizations.csv",
-
         input_dir / "combined" / "locan_all_localizations.csv",
         input_dir / "combined" / "napari_all_points.csv",
         input_dir / "combined" / "canonical_all_localizations.csv",
-
         input_dir / "combined_exports" / "locan_all_localizations.csv",
         input_dir / "combined_exports" / "napari_all_points.csv",
         input_dir / "combined_exports" / "canonical_all_localizations.csv",
-
         input_dir / "combined_outputs" / "locan_all_localizations.csv",
         input_dir / "combined_outputs" / "napari_all_points.csv",
         input_dir / "combined_outputs" / "canonical_all_localizations.csv",
@@ -306,7 +305,9 @@ def find_run_dir_from_path(path: Path) -> Optional[Path]:
         if (candidate / "batch_manifest.csv").exists():
             return candidate
 
-        if (candidate / "run_summary.json").exists() and (candidate / "batches").exists():
+        if (candidate / "run_summary.json").exists() and (
+            candidate / "batches"
+        ).exists():
             return candidate
 
     return None
@@ -389,7 +390,10 @@ def infer_movie_path_from_manifest(input_path: Path) -> Optional[Path]:
 
                     if batch_dir is not None and pd.notna(row_run_dir):
                         try:
-                            if Path(str(row_run_dir)).expanduser().resolve() == batch_dir:
+                            if (
+                                Path(str(row_run_dir)).expanduser().resolve()
+                                == batch_dir
+                            ):
                                 movie = maybe_valid_movie(row.get("input_path", ""))
                                 if movie is not None:
                                     return movie
@@ -474,6 +478,7 @@ def detect_input_format(df: pd.DataFrame) -> str:
 # Numeric and unit helpers
 # =============================================================================
 
+
 def numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
@@ -531,6 +536,7 @@ def robust_numeric_summary(series: pd.Series) -> Dict[str, Any]:
 # =============================================================================
 # Standardization and filtering
 # =============================================================================
+
 
 def standardize_localizations(
     df: pd.DataFrame,
@@ -728,9 +734,7 @@ def apply_filters(
     filter_report["n_after"] = int(len(filtered))
     filter_report["n_removed"] = int(n_before - len(filtered))
     filter_report["fraction_kept"] = (
-        float(len(filtered) / n_before)
-        if n_before > 0
-        else 0.0
+        float(len(filtered) / n_before) if n_before > 0 else 0.0
     )
 
     return filtered, filter_report
@@ -739,6 +743,7 @@ def apply_filters(
 # =============================================================================
 # Scientific summaries
 # =============================================================================
+
 
 def summarize_positions(df: pd.DataFrame, units: str) -> Dict[str, Any]:
     summary: Dict[str, Any] = {
@@ -828,70 +833,86 @@ def build_quality_flags(
     flags: list[Dict[str, Any]] = []
 
     if len(df) == 0:
-        flags.append({
-            "level": "error",
-            "code": "EMPTY_STANDARDIZED_TABLE",
-            "message": "No valid x/y localizations after standardization/filtering.",
-        })
+        flags.append(
+            {
+                "level": "error",
+                "code": "EMPTY_STANDARDIZED_TABLE",
+                "message": "No valid x/y localizations after standardization/filtering.",
+            }
+        )
         return flags
 
     for col in ["position_x", "position_y"]:
         if col not in df.columns or df[col].dropna().empty:
-            flags.append({
-                "level": "error",
-                "code": f"MISSING_{col.upper()}",
-                "message": f"{col} is missing or empty.",
-            })
+            flags.append(
+                {
+                    "level": "error",
+                    "code": f"MISSING_{col.upper()}",
+                    "message": f"{col} is missing or empty.",
+                }
+            )
 
     x = numeric(df["position_x"]).dropna()
     y = numeric(df["position_y"]).dropna()
 
     if len(x) > 0 and len(y) > 0:
         if float(x.max() - x.min()) == 0 or float(y.max() - y.min()) == 0:
-            flags.append({
-                "level": "warning",
-                "code": "DEGENERATE_XY_RANGE",
-                "message": "X or Y range is degenerate. Check coordinate mapping.",
-            })
+            flags.append(
+                {
+                    "level": "warning",
+                    "code": "DEGENERATE_XY_RANGE",
+                    "message": "X or Y range is degenerate. Check coordinate mapping.",
+                }
+            )
 
     if "frame" not in df.columns or df["frame"].dropna().empty:
-        flags.append({
-            "level": "info",
-            "code": "NO_FRAME_INFORMATION",
-            "message": "Frame information is missing. Temporal QC and drift proxy are limited.",
-        })
+        flags.append(
+            {
+                "level": "info",
+                "code": "NO_FRAME_INFORMATION",
+                "message": "Frame information is missing. Temporal QC and drift proxy are limited.",
+            }
+        )
 
     if units == "pixel" and pixel_size_nm is None:
-        flags.append({
-            "level": "info",
-            "code": "PIXEL_SIZE_NOT_PROVIDED",
-            "message": "Pixel size was not provided. Physical-unit conversion is unavailable.",
-        })
+        flags.append(
+            {
+                "level": "info",
+                "code": "PIXEL_SIZE_NOT_PROVIDED",
+                "message": "Pixel size was not provided. Physical-unit conversion is unavailable.",
+            }
+        )
 
     if "confidence" in df.columns:
         confidence = numeric(df["confidence"]).dropna()
 
         if len(confidence) > 0:
             if confidence.min() < 0:
-                flags.append({
-                    "level": "warning",
-                    "code": "NEGATIVE_CONFIDENCE",
-                    "message": "Some confidence values are negative.",
-                })
+                flags.append(
+                    {
+                        "level": "warning",
+                        "code": "NEGATIVE_CONFIDENCE",
+                        "message": "Some confidence values are negative.",
+                    }
+                )
 
             if confidence.max() > 1.5:
-                flags.append({
-                    "level": "info",
-                    "code": "CONFIDENCE_MAY_BE_SCORE",
-                    "message": "Confidence values exceed 1. They may be scores rather than probabilities.",
-                })
+                flags.append(
+                    {
+                        "level": "info",
+                        "code": "CONFIDENCE_MAY_BE_SCORE",
+                        "message": "Confidence values exceed 1. They may be scores rather than probabilities.",
+                    }
+                )
 
     if filter_report is not None and filter_report.get("fraction_kept", 1.0) < 0.1:
-        flags.append({
-            "level": "warning",
-            "code": "FILTER_REMOVED_MOST_LOCALIZATIONS",
-            "message": "Filters kept less than 10% of localizations. Check thresholds.",
-        })
+        flags.append(
+            {
+                "level": "warning",
+                "code": "FILTER_REMOVED_MOST_LOCALIZATIONS",
+                "message": "Filters kept less than 10% of localizations. Check thresholds.",
+            }
+        )
 
     return flags
 
@@ -899,6 +920,7 @@ def build_quality_flags(
 # =============================================================================
 # Plot helpers
 # =============================================================================
+
 
 def save_empty_plot(out_path: Path, title: str, message: str) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -983,14 +1005,16 @@ def plot_xy_render(
     plt.savefig(out_path, dpi=300)
     plt.close()
 
-    report.update({
-        "enabled": True,
-        "n_points": int(len(valid)),
-        "x_bins": int(x_bins),
-        "y_bins": int(y_bins),
-        "bin_size_requested": float(bin_size),
-        "units": units,
-    })
+    report.update(
+        {
+            "enabled": True,
+            "n_points": int(len(valid)),
+            "x_bins": int(x_bins),
+            "y_bins": int(y_bins),
+            "bin_size_requested": float(bin_size),
+            "units": units,
+        }
+    )
 
     return report
 
@@ -1026,13 +1050,15 @@ def plot_frame_counts(df: pd.DataFrame, out_path: Path) -> Dict[str, Any]:
     plt.savefig(out_path, dpi=300)
     plt.close()
 
-    report.update({
-        "enabled": True,
-        "n_frames": int(len(counts)),
-        "min_count": int(counts.min()),
-        "max_count": int(counts.max()),
-        "mean_count": float(counts.mean()),
-    })
+    report.update(
+        {
+            "enabled": True,
+            "n_frames": int(len(counts)),
+            "min_count": int(counts.min()),
+            "max_count": int(counts.max()),
+            "mean_count": float(counts.mean()),
+        }
+    )
 
     return report
 
@@ -1074,13 +1100,15 @@ def plot_histogram(
     plt.savefig(out_path, dpi=300)
     plt.close()
 
-    report.update({
-        "enabled": True,
-        "n_values": int(len(values)),
-        "min": float(values.min()),
-        "max": float(values.max()),
-        "median": float(values.median()),
-    })
+    report.update(
+        {
+            "enabled": True,
+            "n_values": int(len(values)),
+            "min": float(values.min()),
+            "max": float(values.max()),
+            "median": float(values.median()),
+        }
+    )
 
     return report
 
@@ -1088,6 +1116,7 @@ def plot_histogram(
 # =============================================================================
 # Spatial analyses
 # =============================================================================
+
 
 def plot_nearest_neighbor_histogram(
     df: pd.DataFrame,
@@ -1150,16 +1179,18 @@ def plot_nearest_neighbor_histogram(
     plt.savefig(out_path, dpi=300)
     plt.close()
 
-    report.update({
-        "enabled": True,
-        "n_points_used": int(len(points)),
-        "dimension": int(points.shape[1]),
-        "units": units,
-        "mean": float(np.mean(nn)),
-        "median": float(np.median(nn)),
-        "p05": float(np.quantile(nn, 0.05)),
-        "p95": float(np.quantile(nn, 0.95)),
-    })
+    report.update(
+        {
+            "enabled": True,
+            "n_points_used": int(len(points)),
+            "dimension": int(points.shape[1]),
+            "units": units,
+            "mean": float(np.mean(nn)),
+            "median": float(np.median(nn)),
+            "p05": float(np.quantile(nn, 0.05)),
+            "p95": float(np.quantile(nn, 0.95)),
+        }
+    )
 
     return report
 
@@ -1233,14 +1264,20 @@ def plot_drift_proxy(
     grouped_path = out_path.with_suffix(".csv")
     grouped.to_csv(grouped_path, index=False)
 
-    report.update({
-        "enabled": True,
-        "frame_bin": int(frame_bin),
-        "n_bins": int(len(grouped)),
-        "x_span_median": float(grouped["median_x"].max() - grouped["median_x"].min()),
-        "y_span_median": float(grouped["median_y"].max() - grouped["median_y"].min()),
-        "table": str(grouped_path),
-    })
+    report.update(
+        {
+            "enabled": True,
+            "frame_bin": int(frame_bin),
+            "n_bins": int(len(grouped)),
+            "x_span_median": float(
+                grouped["median_x"].max() - grouped["median_x"].min()
+            ),
+            "y_span_median": float(
+                grouped["median_y"].max() - grouped["median_y"].min()
+            ),
+            "table": str(grouped_path),
+        }
+    )
 
     return report
 
@@ -1281,12 +1318,16 @@ def run_dbscan_clustering(
     try:
         from sklearn.cluster import DBSCAN
     except Exception:
-        save_empty_plot(cluster_plot_path, "DBSCAN clusters", "scikit-learn not installed")
+        save_empty_plot(
+            cluster_plot_path, "DBSCAN clusters", "scikit-learn not installed"
+        )
         report["reason"] = "sklearn_not_installed"
         return report
 
     if eps <= 0 or min_samples <= 0:
-        save_empty_plot(cluster_plot_path, "DBSCAN clusters", "Invalid DBSCAN parameters")
+        save_empty_plot(
+            cluster_plot_path, "DBSCAN clusters", "Invalid DBSCAN parameters"
+        )
         report["reason"] = "invalid_parameters"
         return report
 
@@ -1345,7 +1386,9 @@ def run_dbscan_clustering(
 
         if cluster_points.shape[1] == 3:
             row["centroid_z"] = float(cluster_points[:, 2].mean())
-            row["span_z"] = float(cluster_points[:, 2].max() - cluster_points[:, 2].min())
+            row["span_z"] = float(
+                cluster_points[:, 2].max() - cluster_points[:, 2].min()
+            )
 
         cluster_rows.append(row)
 
@@ -1362,15 +1405,17 @@ def run_dbscan_clustering(
     plt.savefig(cluster_plot_path, dpi=300)
     plt.close()
 
-    report.update({
-        "enabled": True,
-        "sampled": bool(sampled),
-        "n_points_used": int(len(points)),
-        "dimension": int(points.shape[1]),
-        "n_clusters": n_clusters,
-        "n_noise": n_noise,
-        "noise_fraction": float(n_noise / len(points)) if len(points) > 0 else None,
-    })
+    report.update(
+        {
+            "enabled": True,
+            "sampled": bool(sampled),
+            "n_points_used": int(len(points)),
+            "dimension": int(points.shape[1]),
+            "n_clusters": n_clusters,
+            "n_noise": n_noise,
+            "noise_fraction": float(n_noise / len(points)) if len(points) > 0 else None,
+        }
+    )
 
     return report
 
@@ -1460,12 +1505,14 @@ def run_ripley_l_proxy(
         l_value = math.sqrt(k_value / math.pi)
         l_minus_r = l_value - r
 
-        rows.append({
-            "radius": float(r),
-            "K": float(k_value),
-            "L": float(l_value),
-            "L_minus_r": float(l_minus_r),
-        })
+        rows.append(
+            {
+                "radius": float(r),
+                "K": float(k_value),
+                "L": float(l_value),
+                "L_minus_r": float(l_minus_r),
+            }
+        )
 
     result = pd.DataFrame(rows)
     result.to_csv(table_path, index=False)
@@ -1482,15 +1529,17 @@ def run_ripley_l_proxy(
 
     idx_max = result["L_minus_r"].idxmax()
 
-    report.update({
-        "enabled": True,
-        "n_points_used": int(n),
-        "area": float(area),
-        "max_radius": float(max_radius),
-        "n_radii": int(n_radii),
-        "max_L_minus_r": float(result["L_minus_r"].max()),
-        "radius_at_max_L_minus_r": float(result.loc[idx_max, "radius"]),
-    })
+    report.update(
+        {
+            "enabled": True,
+            "n_points_used": int(n),
+            "area": float(area),
+            "max_radius": float(max_radius),
+            "n_radii": int(n_radii),
+            "max_L_minus_r": float(result["L_minus_r"].max()),
+            "radius_at_max_L_minus_r": float(result.loc[idx_max, "radius"]),
+        }
+    )
 
     return report
 
@@ -1498,6 +1547,7 @@ def run_ripley_l_proxy(
 # =============================================================================
 # Locan-style review
 # =============================================================================
+
 
 def run_locan_review(
     standardized: pd.DataFrame,
@@ -1670,6 +1720,7 @@ def run_locan_review(
 # napari integration
 # =============================================================================
 
+
 def load_movie_projection(movie_path: Path) -> Optional[np.ndarray]:
     if movie_path is None:
         return None
@@ -1724,8 +1775,7 @@ def create_napari_points(
     points = df[coord_cols].to_numpy(dtype=float)
 
     feature_cols = [
-        c for c in df.columns
-        if c not in ["position_x", "position_y", "position_z"]
+        c for c in df.columns if c not in ["position_x", "position_y", "position_z"]
     ]
 
     features = df[feature_cols].copy()
@@ -1810,18 +1860,12 @@ def write_napari_helper(
     helper_path = review_dir / "open_review_in_napari.py"
 
     movie_line = (
-        f"movie_path = Path(r'{movie_path}')"
-        if movie_path
-        else "movie_path = None"
+        f"movie_path = Path(r'{movie_path}')" if movie_path else "movie_path = None"
     )
 
-    color_line = (
-        f'color_by = "{color_by}"'
-        if color_by
-        else "color_by = None"
-    )
+    color_line = f'color_by = "{color_by}"' if color_by else "color_by = None"
 
-    helper_code = f'''\
+    helper_code = f"""\
 from pathlib import Path
 import pandas as pd
 import numpy as np
@@ -1886,7 +1930,7 @@ if color_by is not None and color_by in features.columns:
 viewer.add_points(points, **kwargs)
 
 napari.run()
-'''
+"""
 
     helper_path.write_text(helper_code, encoding="utf-8")
 
@@ -1938,6 +1982,7 @@ except Exception as exc:
 # =============================================================================
 # Main review runner
 # =============================================================================
+
 
 def run_review(
     input_path: str | Path,
@@ -2114,6 +2159,7 @@ def run_review(
 # =============================================================================
 # CLI
 # =============================================================================
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -2346,7 +2392,9 @@ def main() -> None:
     print(f"  - review table: {display_path(summary['review_table'])}")
     print(f"  - napari helper: {display_path(summary['napari_helper_script'])}")
     print(f"  - locan helper: {display_path(summary['locan_helper_script'])}")
-    print(f"  - summary: {display_path(Path(summary['review_dir']) / 'napari_locan_review_summary.json')}")
+    print(
+        f"  - summary: {display_path(Path(summary['review_dir']) / 'napari_locan_review_summary.json')}"
+    )
 
     inferred_movie = summary.get("movie_path_inferred")
 
@@ -2364,8 +2412,12 @@ def main() -> None:
         dbscan_report = summary.get("locan_summary", {}).get("dbscan", {})
 
         if dbscan_report.get("enabled"):
-            print(f"  - dbscan clustered points: {display_path(dbscan_report.get('path_clustered_points'))}")
-            print(f"  - dbscan cluster summary: {display_path(dbscan_report.get('path_cluster_summary'))}")
+            print(
+                f"  - dbscan clustered points: {display_path(dbscan_report.get('path_clustered_points'))}"
+            )
+            print(
+                f"  - dbscan cluster summary: {display_path(dbscan_report.get('path_cluster_summary'))}"
+            )
 
         ripley_report = summary.get("locan_summary", {}).get("ripley_l_proxy", {})
 

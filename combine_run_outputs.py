@@ -247,12 +247,8 @@ def collect_downstream_index(
         "canonical_localizations": str(canonical_path)
         if canonical_path.exists()
         else "",
-        "picasso_thunderstorm_csv": str(picasso_path)
-        if picasso_path.exists()
-        else "",
-        "napari_points_csv": str(napari_path)
-        if napari_path.exists()
-        else "",
+        "picasso_thunderstorm_csv": str(picasso_path) if picasso_path.exists() else "",
+        "napari_points_csv": str(napari_path) if napari_path.exists() else "",
         "downstream_export_report": str(export_report_path)
         if export_report_path.exists()
         else "",
@@ -359,7 +355,9 @@ def main() -> None:
     print("Combined exports created.")
     print(f"Status:           {report.get('status', '')}")
     print(f"Combined dir:     {report.get('combined_dir', '')}")
-    print(f"Canonical all:    {report['outputs'].get('canonical_all_localizations', '')}")
+    print(
+        f"Canonical all:    {report['outputs'].get('canonical_all_localizations', '')}"
+    )
     print(f"Napari all:       {report['outputs'].get('napari_all_points', '')}")
     print(f"Export index:     {report['outputs'].get('downstream_exports_index', '')}")
     print(f"Combined report:  {report['outputs'].get('combined_export_report', '')}")

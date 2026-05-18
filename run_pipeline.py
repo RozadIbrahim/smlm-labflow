@@ -2,43 +2,50 @@
 """
 run_pipeline.py
 
-Main SMLM wrapper pipeline.
+Main SMLM LabFlow wrapper pipeline.
 
-User-facing CLI.
+Scientist-facing CLI:
+
+    python run_pipeline.py calibrate -i data/beads  -p profiles/dna_paint_standard.yaml
+    python run_pipeline.py train     -i data/train  -p profiles/dna_paint_standard.yaml
+    python run_pipeline.py infer     -i data/movies -p profiles/dna_paint_standard.yaml
+
+Optional named parent run folder:
+
+    python run_pipeline.py infer \
+        -i data/movies \
+        -p profiles/dna_paint_standard.yaml \
+        -o outputs/npc_condition_A
+
+Backend override, only when needed:
+
+    python run_pipeline.py infer \
+        -i data/movies \
+        -p profiles/dna_paint_standard.yaml \
+        -b liteloc
+
+Output layout for every run:
+
+    parent_run_folder/
+    ├── results/
+    ├── benchmarks/
+    ├── reports/
+    ├── registry/
+    └── README_RUN.txt
 
 Architecture:
-    QC
-    → LiteLoc adapter
-    → post_inference.run_post_inference()
-        → canonical CSV
-        → localization QC
-        → SMAP/Picasso/napari/Locan adapted exports
-    → combined run-level exports
+    calibrate/train/infer subcommand
+    → profile loading
+    → automatic backend resolution
+    → backend adapter
+    → benchmark pack
+    → registry/artifact snapshot
     → supervisor-friendly report
 
 Important:
-    This script does NOT open napari and does NOT run Locan analysis.
+    This script does NOT open napari and does NOT run interactive Locan analysis.
     napari/Locan review should be run separately in napari_locan_env using
     napari_locan_review.py.
-
-Normal command:
-    python run_pipeline.py \
-        --input data/raw_movies \
-        --out results/run_001 \
-        --profile profiles/dna_paint_standard.yaml \
-        --backend liteloc \
-        --coord-units nm \
-        --pixel-size-nm 65
-
-Quick test:
-    python run_pipeline.py \
-        --input data/raw_movies \
-        --out results/test_run \
-        --profile profiles/dna_paint_standard.yaml \
-        --backend liteloc \
-        --coord-units nm \
-        --pixel-size-nm 65 \
-        --max-files 1
 """
 
 from __future__ import annotations
@@ -47,14 +54,26 @@ import argparse
 import csv
 import hashlib
 import importlib
+import inspect
 import json
 import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
-from runtime_benchmark import RuntimeBenchmark
+try:
+    from benchmark import RuntimeBenchmark
+except Exception:  # pragma: no cover - compatibility fallback
+    from runtime_benchmark import RuntimeBenchmark  # type: ignore
+
+try:
+    from run_folders import RunFolders, prepare_parent_run_folder, write_run_status
+except Exception as exc:  # pragma: no cover
+    raise ImportError(
+        "Could not import run_folders.py. Put run_folders.py in the project root "
+        "before using this upgraded run_pipeline.py."
+    ) from exc
 
 
 TIFF_EXTENSIONS = (
@@ -64,10 +83,22 @@ TIFF_EXTENSIONS = (
     ".ome.tiff",
 )
 
+VALID_STEPS = {"calibrate", "train", "infer"}
+DEFAULT_BACKEND = "liteloc"
+
 
 # =============================================================================
 # Basic utilities
 # =============================================================================
+
+
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def project_root() -> Path:
+    return Path(__file__).resolve().parent
+
 
 def is_tiff(path: Path) -> bool:
     name = path.name.lower()
@@ -84,25 +115,26 @@ def safe_stem(path: Path) -> str:
 
     name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
     name = name.strip("._-")
-
     return name or "movie"
 
 
-def make_run_id(path: Path, index: int) -> str:
+def safe_name(text: str) -> str:
+    text = str(text).strip()
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", text)
+    text = text.strip("._-")
+    return text or "run"
+
+
+def make_batch_id(path: Path, index: int) -> str:
     digest = hashlib.sha1(str(path.resolve()).encode("utf-8")).hexdigest()[:8]
     return f"{index:04d}_{safe_stem(path)}_{digest}"
 
 
 def display_path(path: Path | str | None, base: Optional[Path] = None) -> str:
-    """
-    Return a clean relative path for terminal output when possible.
-    Internal paths remain absolute.
-    """
     if path is None:
         return ""
 
     path = Path(path)
-
     if str(path).strip() == "":
         return ""
 
@@ -122,7 +154,64 @@ def display_path(path: Path | str | None, base: Optional[Path] = None) -> str:
         return str(path)
 
 
-def discover_tiff_movies(input_path: Path) -> List[Path]:
+def write_json(data: Any, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(data, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+
+
+def write_text(text: str, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def write_yaml_if_possible(data: Any, path: Path) -> None:
+    try:
+        import yaml
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True)
+    except Exception:
+        json_path = path.with_suffix(".json")
+        write_json(data, json_path)
+
+
+def flatten_for_csv(row: Mapping[str, Any]) -> Dict[str, Any]:
+    clean: Dict[str, Any] = {}
+    for key, value in row.items():
+        if isinstance(value, (dict, list, tuple)):
+            clean[key] = json.dumps(value, ensure_ascii=False, default=str)
+        else:
+            clean[key] = value
+    return clean
+
+
+def write_manifest_csv(rows: Sequence[Mapping[str, Any]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+
+    fieldnames: List[str] = []
+    for row in rows:
+        for key in row.keys():
+            if key not in fieldnames:
+                fieldnames.append(key)
+
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(flatten_for_csv(row))
+
+
+def discover_tiff_movies(
+    input_path: Path, max_files: Optional[int] = None
+) -> List[Path]:
     input_path = input_path.expanduser().resolve()
 
     if input_path.is_file():
@@ -134,101 +223,18 @@ def discover_tiff_movies(input_path: Path) -> List[Path]:
         raise FileNotFoundError(f"Input path does not exist: {input_path}")
 
     movies = [p.resolve() for p in input_path.rglob("*") if is_tiff(p)]
+    movies = sorted(movies, key=lambda p: str(p).lower())
 
-    return sorted(movies, key=lambda p: str(p).lower())
+    if max_files is not None:
+        movies = movies[:max_files]
 
-
-def write_json(data: Any, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(data, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-
-def get_numbered_out_dir(out_dir: Path, force: bool = False) -> Path:
-    """
-    Return a safe output directory.
-
-    Behavior:
-        - If out_dir does not exist: use it.
-        - If out_dir exists and is empty: use it.
-        - If out_dir exists and is non-empty:
-            - with --force: reuse it.
-            - without --force: create numbered sibling folder.
-    """
-    out_dir = out_dir.expanduser().resolve()
-
-    if force:
-        return out_dir
-
-    if not out_dir.exists():
-        return out_dir
-
-    if out_dir.is_dir() and not any(out_dir.iterdir()):
-        return out_dir
-
-    parent = out_dir.parent
-    base_name = out_dir.name
-
-    match = re.match(r"^(.*?)(?:_(\d{3,}))$", base_name)
-
-    if match:
-        prefix = match.group(1)
-        start_number = int(match.group(2)) + 1
-    else:
-        prefix = base_name
-        start_number = 1
-
-    for number in range(start_number, 10000):
-        candidate = parent / f"{prefix}_{number:03d}"
-
-        if not candidate.exists():
-            return candidate
-
-        if candidate.is_dir() and not any(candidate.iterdir()):
-            return candidate
-
-    raise RuntimeError(f"Could not find available numbered output directory for: {out_dir}")
-
-
-def flatten_for_csv(row: Dict[str, Any]) -> Dict[str, Any]:
-    clean: Dict[str, Any] = {}
-
-    for key, value in row.items():
-        if isinstance(value, (dict, list, tuple)):
-            clean[key] = json.dumps(value, ensure_ascii=False)
-        else:
-            clean[key] = value
-
-    return clean
-
-
-def write_manifest_csv(rows: List[Dict[str, Any]], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    if not rows:
-        path.write_text("", encoding="utf-8")
-        return
-
-    fieldnames: List[str] = []
-
-    for row in rows:
-        for key in row.keys():
-            if key not in fieldnames:
-                fieldnames.append(key)
-
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-
-        for row in rows:
-            writer.writerow(flatten_for_csv(row))
+    return movies
 
 
 # =============================================================================
-# Profile loading
+# Profile loading and profile access
 # =============================================================================
+
 
 def load_profile(profile_path: Path) -> Dict[str, Any]:
     profile_path = profile_path.expanduser().resolve()
@@ -238,13 +244,10 @@ def load_profile(profile_path: Path) -> Dict[str, Any]:
 
     try:
         import yaml
-    except ImportError:
-        return {
-            "profile_path": str(profile_path),
-            "profile_loaded": False,
-            "profile_warning": "PyYAML not installed; profile was not parsed.",
-            "backend": {"name": "liteloc"},
-        }
+    except ImportError as exc:
+        raise ImportError(
+            "PyYAML is required to parse profile YAML files. Install it with: pip install PyYAML"
+        ) from exc
 
     with profile_path.open("r", encoding="utf-8") as f:
         profile = yaml.safe_load(f) or {}
@@ -254,52 +257,47 @@ def load_profile(profile_path: Path) -> Dict[str, Any]:
 
     profile["profile_path"] = str(profile_path)
     profile["profile_loaded"] = True
-
     return profile
 
 
-def get_nested(data: Dict[str, Any], keys: List[str], default: Any = None) -> Any:
+def get_nested(
+    data: Mapping[str, Any], keys: Sequence[str], default: Any = None
+) -> Any:
     current: Any = data
-
     for key in keys:
-        if not isinstance(current, dict):
+        if not isinstance(current, Mapping):
             return default
         current = current.get(key)
-
     return default if current is None else current
 
 
-def get_backend_name(profile: Dict[str, Any], cli_backend: Optional[str]) -> str:
-    if cli_backend:
-        return cli_backend
+def set_nested(data: Dict[str, Any], keys: Sequence[str], value: Any) -> None:
+    current = data
+    for key in keys[:-1]:
+        if key not in current or not isinstance(current[key], dict):
+            current[key] = {}
+        current = current[key]
+    current[keys[-1]] = value
+
+
+def profile_name(profile: Mapping[str, Any], profile_path: Path) -> str:
+    return safe_name(str(profile.get("profile_name") or profile_path.stem))
+
+
+def get_backend_name(
+    profile: Mapping[str, Any], backend_override: Optional[str]
+) -> str:
+    if backend_override:
+        return backend_override.strip().lower()
 
     backend_block = profile.get("backend", {})
+    if isinstance(backend_block, Mapping):
+        return str(backend_block.get("name", DEFAULT_BACKEND)).strip().lower()
 
-    if isinstance(backend_block, dict):
-        return str(backend_block.get("name", "liteloc"))
-
-    return "liteloc"
+    return DEFAULT_BACKEND
 
 
-def infer_pixel_size_nm(
-    profile: Dict[str, Any],
-    cli_pixel_size_nm: Optional[float],
-) -> Optional[float]:
-    """
-    Resolve pixel size from CLI first, then profile.
-
-    Supported profile locations:
-        pixel_size_nm
-        data.pixel_size_nm
-        input.pixel_size_nm
-        camera.pixel_size_nm
-        acquisition.pixel_size_nm
-        microscope.pixel_size_nm
-        smlm.pixel_size_nm
-    """
-    if cli_pixel_size_nm is not None:
-        return float(cli_pixel_size_nm)
-
+def infer_pixel_size_nm(profile: Mapping[str, Any]) -> Optional[float]:
     candidate_paths = [
         ["pixel_size_nm"],
         ["data", "pixel_size_nm"],
@@ -312,51 +310,507 @@ def infer_pixel_size_nm(
 
     for keys in candidate_paths:
         value = get_nested(profile, keys, default=None)
-
         if value is not None:
             try:
                 return float(value)
             except Exception:
                 pass
-
     return None
 
 
+def infer_coord_units(profile: Mapping[str, Any]) -> str:
+    value = (
+        get_nested(profile, ["inference", "coord_units"], None)
+        or get_nested(profile, ["canonical", "coordinate_unit"], None)
+        or get_nested(profile, ["outputs", "coord_units"], None)
+        or "auto"
+    )
+    value = str(value).lower().strip()
+    return value if value in {"auto", "nm", "pixel"} else "auto"
+
+
+def infer_default_locprec_nm(profile: Mapping[str, Any]) -> float:
+    value = (
+        get_nested(profile, ["post_inference", "default_locprec_nm"], None)
+        or get_nested(profile, ["downstream", "default_locprec_nm"], None)
+        or 20.0
+    )
+    try:
+        return float(value)
+    except Exception:
+        return 20.0
+
+
+def infer_default_lpx_px(profile: Mapping[str, Any]) -> float:
+    value = (
+        get_nested(profile, ["post_inference", "default_lpx_px"], None)
+        or get_nested(profile, ["downstream", "default_lpx_px"], None)
+        or 1.0
+    )
+    try:
+        return float(value)
+    except Exception:
+        return 1.0
+
+
+def infer_export_setting(profile: Mapping[str, Any], name: str) -> Optional[bool]:
+    """
+    Return explicit export setting from profile, or None to let post_inference decide.
+    Supports both downstream.export_picasso and outputs.export_picasso.
+    """
+    candidates = [
+        get_nested(profile, ["downstream", f"export_{name}"], None),
+        get_nested(profile, ["outputs", f"export_{name}"], None),
+        get_nested(profile, ["exports", name], None),
+    ]
+    for value in candidates:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.lower().strip()
+            if lowered in {"true", "yes", "1", "on"}:
+                return True
+            if lowered in {"false", "no", "0", "off"}:
+                return False
+    return None
+
+
+def profile_cli_overrides(profile: Mapping[str, Any]) -> Dict[str, Any]:
+    """
+    Runtime overrides come from profile fields, not public CLI paths.
+    This keeps the user interface friendly while still giving the resolver what it needs.
+    """
+    values = {
+        "psf_type": get_nested(profile, ["experiment", "psf_type"], None)
+        or get_nested(profile, ["psf", "type"], None),
+        "psf_dimensionality": get_nested(
+            profile, ["experiment", "dimensionality"], None
+        )
+        or get_nested(profile, ["psf", "dimensionality"], None),
+        "device": get_nested(profile, ["inference", "device"], None),
+        "batch_size": get_nested(profile, ["inference", "batch_size"], None),
+        "threshold": get_nested(profile, ["inference", "threshold"], None),
+        "coord_units": infer_coord_units(profile),
+        "pixel_size_nm": infer_pixel_size_nm(profile),
+    }
+    return {k: v for k, v in values.items() if v is not None}
+
+
 # =============================================================================
-# Dynamic imports
+# Dynamic call helpers
 # =============================================================================
+
+
+def call_with_supported_kwargs(fn: Callable[..., Any], **kwargs: Any) -> Any:
+    """
+    Call a function with only the keyword arguments it supports.
+    Allows old and new adapters to coexist.
+    """
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn(**kwargs)
+
+    parameters = signature.parameters
+    accepts_kwargs = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()
+    )
+
+    if accepts_kwargs:
+        return fn(**kwargs)
+
+    supported_kwargs = {
+        key: value for key, value in kwargs.items() if key in parameters
+    }
+    return fn(**supported_kwargs)
+
+
+def import_optional_module(module_name: str) -> Tuple[Optional[Any], str]:
+    try:
+        return importlib.import_module(module_name), f"imported {module_name}"
+    except ModuleNotFoundError:
+        return None, f"{module_name} not found"
+    except Exception as exc:
+        return None, f"{module_name} import failed: {repr(exc)}"
+
+
+# =============================================================================
+# Resolver bridge
+# =============================================================================
+
+
+def default_backend_paths_file() -> Path:
+    return project_root() / "adapters" / "backend_paths.yml"
+
+
+def load_backend_paths_fallback() -> Dict[str, Any]:
+    path = default_backend_paths_file().resolve()
+
+    if not path.exists():
+        return {
+            "status": "missing_backend_paths_file",
+            "backend_paths_file": str(path),
+            "backend_paths": {},
+        }
+
+    try:
+        import yaml
+    except ImportError:
+        return {
+            "status": "pyyaml_missing",
+            "backend_paths_file": str(path),
+            "backend_paths": {},
+        }
+
+    with path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    if not isinstance(data, dict):
+        raise ValueError(f"backend_paths.yml is not a YAML dictionary: {path}")
+
+    return {
+        "status": "fallback_loaded_backend_paths",
+        "backend_paths_file": str(path),
+        "backend_paths": data,
+    }
+
+
+def resolve_backend_runtime_config(
+    step: str,
+    profile: Dict[str, Any],
+    backend_name: str,
+    folders: RunFolders,
+) -> Dict[str, Any]:
+    """
+    Resolve backend runtime automatically.
+
+    Public CLI does not expose backend_paths, calibration_file, or model_path.
+    The resolver should use:
+        profile YAML
+        adapters/backend_paths.yml
+        global registry under outputs/registry
+        current run folders
+    """
+    cli_overrides = profile_cli_overrides(profile)
+    backend_paths_file = default_backend_paths_file().resolve()
+
+    resolver, import_message = import_optional_module("adapters.resolver")
+    if resolver is None:
+        fallback = load_backend_paths_fallback()
+        return {
+            "status": "resolver_import_failed",
+            "message": import_message,
+            "step": step,
+            "backend_name": backend_name,
+            "backend_paths_file": str(backend_paths_file),
+            "project_root": str(project_root()),
+            "run_parent": str(folders.parent),
+            "results_dir": str(folders.results),
+            "benchmarks_dir": str(folders.benchmarks),
+            "reports_dir": str(folders.reports),
+            "registry_dir": str(folders.registry),
+            "cli_overrides": cli_overrides,
+            **fallback,
+        }
+
+    resolver_function_names = [
+        "resolve_backend_runtime",
+        "resolve_backend_config",
+        "resolve_backend",
+        "resolve_liteloc_runtime",
+        "resolve_liteloc_paths",
+        "resolve_paths",
+    ]
+
+    resolver_fn: Optional[Callable[..., Any]] = None
+    resolver_fn_name = ""
+    for name in resolver_function_names:
+        candidate = getattr(resolver, name, None)
+        if callable(candidate):
+            resolver_fn = candidate
+            resolver_fn_name = name
+            break
+
+    if resolver_fn is None:
+        fallback = load_backend_paths_fallback()
+        return {
+            "status": "resolver_function_missing",
+            "message": (
+                "adapters.resolver was found, but no supported public resolver "
+                "function was found. Add resolve_backend_runtime()."
+            ),
+            "step": step,
+            "backend_name": backend_name,
+            "backend_paths_file": str(backend_paths_file),
+            "project_root": str(project_root()),
+            "run_parent": str(folders.parent),
+            "results_dir": str(folders.results),
+            "benchmarks_dir": str(folders.benchmarks),
+            "reports_dir": str(folders.reports),
+            "registry_dir": str(folders.registry),
+            "cli_overrides": cli_overrides,
+            **fallback,
+        }
+
+    resolved = call_with_supported_kwargs(
+        resolver_fn,
+        step=step,
+        command=step,
+        profile=profile,
+        backend_name=backend_name,
+        backend_paths_file=backend_paths_file,
+        backend_paths_path=backend_paths_file,
+        cli_overrides=cli_overrides,
+        project_root=project_root(),
+        out_dir=folders.results,
+        run_parent=folders.parent,
+        results_dir=folders.results,
+        benchmarks_dir=folders.benchmarks,
+        reports_dir=folders.reports,
+        registry_dir=folders.registry,
+    )
+
+    if not isinstance(resolved, dict):
+        raise TypeError(
+            f"adapters.resolver.{resolver_fn_name}() must return a dictionary, "
+            f"got {type(resolved).__name__}"
+        )
+
+    # Profile-derived overrides win over fallback defaults, but real resolver may also set richer keys.
+    for key, value in cli_overrides.items():
+        resolved.setdefault(key, value)
+
+    resolved.setdefault("status", "passed")
+    resolved.setdefault("step", step)
+    resolved.setdefault("backend_name", backend_name)
+    resolved.setdefault("backend_paths_file", str(backend_paths_file))
+    resolved.setdefault("project_root", str(project_root()))
+    resolved.setdefault("run_parent", str(folders.parent))
+    resolved.setdefault("results_dir", str(folders.results))
+    resolved.setdefault("benchmarks_dir", str(folders.benchmarks))
+    resolved.setdefault("reports_dir", str(folders.reports))
+    resolved.setdefault("registry_dir", str(folders.registry))
+    resolved.setdefault("cli_overrides", cli_overrides)
+    resolved.setdefault("resolver_function", f"adapters.resolver.{resolver_fn_name}")
+    resolved["resolved_at"] = now_iso()
+    return resolved
+
+
+# =============================================================================
+# Adapter discovery and execution
+# =============================================================================
+
+
+def backend_module_name(backend_name: str) -> str:
+    backend_name = backend_name.lower().strip()
+    if backend_name == "liteloc":
+        return "adapters.liteloc_adapter"
+    return f"adapters.{backend_name}_adapter"
+
+
+def get_backend_step_function(
+    backend_name: str,
+    step: str,
+) -> Tuple[Optional[Callable[..., Any]], str]:
+    module_name = backend_module_name(backend_name)
+    module, import_message = import_optional_module(module_name)
+
+    if module is None:
+        return None, import_message
+
+    candidates_by_step = {
+        "calibrate": [
+            "run_liteloc_calibration",
+            "run_calibration",
+            "calibrate_liteloc",
+            "run_calibrate",
+            "calibrate",
+        ],
+        "train": [
+            "run_liteloc_training",
+            "run_training",
+            "train_liteloc",
+            "run_train",
+            "train",
+        ],
+        "infer": [
+            "run_liteloc_one_movie",
+            "run_inference_one_movie",
+            "run_liteloc_inference",
+            "run_inference",
+            "run_liteloc",
+            "infer",
+        ],
+    }
+
+    for name in candidates_by_step.get(step, []):
+        fn = getattr(module, name, None)
+        if callable(fn):
+            return fn, f"using {module_name}.{name}"
+
+    return None, f"No supported {step} function found in {module_name}"
+
+
+def call_backend_function(
+    fn: Callable[..., Any],
+    step: str,
+    input_path: Path,
+    out_dir: Path,
+    profile: Dict[str, Any],
+    backend_config: Dict[str, Any],
+    batch_index: Optional[int] = None,
+) -> Any:
+    try:
+        return call_with_supported_kwargs(
+            fn,
+            step=step,
+            command=step,
+            input_path=input_path,
+            movie_path=input_path,
+            train_path=input_path,
+            calibration_path=input_path,
+            out_dir=out_dir,
+            output_dir=out_dir,
+            results_dir=out_dir,
+            profile=profile,
+            backend_config=backend_config,
+            runtime_config=backend_config,
+            batch_index=batch_index,
+        )
+    except TypeError:
+        return fn(input_path, out_dir, profile)
+
+
+def normalize_backend_result(
+    result: Any,
+    backend_name: str,
+    step: str,
+    message: str,
+) -> Dict[str, Any]:
+    if isinstance(result, dict):
+        clean = dict(result)
+    elif result is None:
+        clean = {}
+    else:
+        clean = {"output_path": str(result)}
+
+    status_key = f"{step}_status"
+    clean.setdefault(
+        status_key, "passed" if result is not None else "pending_no_output"
+    )
+    clean.setdefault("backend_status", clean.get(status_key, "passed"))
+    clean.setdefault("backend_name", backend_name)
+    clean.setdefault("backend_message", message)
+
+    if step == "calibrate":
+        artifact = (
+            clean.get("calibration_file")
+            or clean.get("calibration_path")
+            or clean.get("calibration_model")
+            or clean.get("output_path")
+        )
+        clean.setdefault("calibration_file", artifact or "")
+
+    elif step == "train":
+        artifact = (
+            clean.get("model_path")
+            or clean.get("checkpoint_path")
+            or clean.get("checkpoint")
+            or clean.get("output_path")
+        )
+        clean.setdefault("model_path", artifact or "")
+
+    elif step == "infer":
+        artifact = (
+            clean.get("raw_output_path")
+            or clean.get("raw_output")
+            or clean.get("localization_csv")
+            or clean.get("output_path")
+        )
+        clean.setdefault("raw_output_path", artifact or "")
+
+    return clean
+
+
+def run_backend_step(
+    step: str,
+    backend_name: str,
+    input_path: Path,
+    out_dir: Path,
+    profile: Dict[str, Any],
+    backend_config: Dict[str, Any],
+    batch_index: Optional[int] = None,
+) -> Dict[str, Any]:
+    fn, message = get_backend_step_function(backend_name=backend_name, step=step)
+
+    if fn is None:
+        return {
+            "backend_status": "pending_adapter_missing",
+            f"{step}_status": "pending_adapter_missing",
+            "backend_name": backend_name,
+            "backend_message": message,
+        }
+
+    try:
+        result = call_backend_function(
+            fn=fn,
+            step=step,
+            input_path=input_path,
+            out_dir=out_dir,
+            profile=profile,
+            backend_config=backend_config,
+            batch_index=batch_index,
+        )
+        return normalize_backend_result(
+            result=result,
+            backend_name=backend_name,
+            step=step,
+            message=message,
+        )
+    except Exception as exc:
+        return {
+            "backend_status": "failed",
+            f"{step}_status": "failed",
+            "backend_name": backend_name,
+            "backend_message": repr(exc),
+        }
+
+
+# =============================================================================
+# QC, post-inference, combine, report
+# =============================================================================
+
 
 def get_qc_function() -> Callable[..., Dict[str, Any]]:
     try:
         from qc_input import qc_one_movie
     except Exception as exc:
         raise ImportError(
-            "Could not import qc_one_movie from qc_input.py. "
-            "Make sure qc_input.py exists in the project root."
+            "Could not import qc_one_movie from qc_input.py. Make sure qc_input.py exists."
         ) from exc
-
     return qc_one_movie
 
 
-def get_optional_liteloc_function() -> Tuple[Optional[Callable[..., Any]], str]:
+def run_qc_safely(
+    qc_one_movie: Callable[..., Dict[str, Any]],
+    movie_path: Path,
+    movie_out_dir: Path,
+) -> Dict[str, Any]:
     try:
-        module = importlib.import_module("adapters.liteloc_adapter")
-    except ModuleNotFoundError:
-        return None, "adapters.liteloc_adapter not found"
+        return call_with_supported_kwargs(
+            qc_one_movie,
+            input_path=movie_path,
+            movie_path=movie_path,
+            out_dir=movie_out_dir,
+            output_dir=movie_out_dir,
+        )
+    except TypeError:
+        try:
+            return qc_one_movie(movie_path, movie_out_dir)
+        except Exception as exc:
+            return {"qc_status": "failed", "qc_error": repr(exc)}
     except Exception as exc:
-        return None, f"adapters.liteloc_adapter import failed: {repr(exc)}"
-
-    for name in [
-        "run_liteloc_one_movie",
-        "run_inference_one_movie",
-        "run_liteloc",
-    ]:
-        fn = getattr(module, name, None)
-
-        if callable(fn):
-            return fn, f"using adapters.liteloc_adapter.{name}"
-
-    return None, "No supported LiteLoc adapter function found"
+        return {"qc_status": "failed", "qc_error": repr(exc)}
 
 
 def get_post_inference_function() -> Callable[..., Dict[str, Any]]:
@@ -365,240 +819,630 @@ def get_post_inference_function() -> Callable[..., Dict[str, Any]]:
     except Exception as exc:
         raise ImportError(
             "Could not import run_post_inference from post_inference.py. "
-            "Make sure post_inference.py exists in the project root."
+            "Make sure post_inference.py exists."
         ) from exc
-
     return run_post_inference
 
 
-# =============================================================================
-# Backend execution
-# =============================================================================
-
-def run_backend_if_available(
-    backend_name: str,
-    movie_path: Path,
+def run_post_inference_safely(
+    run_post_inference: Callable[..., Dict[str, Any]],
+    raw_output_path: str | Path,
     movie_out_dir: Path,
     profile: Dict[str, Any],
-) -> Dict[str, Any]:
-    backend_name = backend_name.lower().strip()
-
-    if backend_name != "liteloc":
-        return {
-            "backend_status": "skipped_unsupported_backend",
-            "backend_name": backend_name,
-            "backend_message": f"Unsupported backend: {backend_name}",
-            "raw_output_path": "",
-        }
-
-    fn, message = get_optional_liteloc_function()
-
-    if fn is None:
-        return {
-            "backend_status": "pending_adapter_missing",
-            "backend_name": "liteloc",
-            "backend_message": message,
-            "raw_output_path": "",
-        }
-
+    backend_name: str,
+    source_file: Path,
+    coord_units: str,
+    pixel_size_nm: Optional[float],
+    default_locprec_nm: float,
+    default_lpx_px: float,
+    napari_units: str,
+    locan_units: str,
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     try:
-        raw_output = fn(
-            input_path=movie_path,
+        post_summary = call_with_supported_kwargs(
+            run_post_inference,
+            input_path=raw_output_path,
+            raw_output_path=raw_output_path,
             out_dir=movie_out_dir,
+            output_dir=movie_out_dir,
             profile=profile,
+            backend_name=backend_name,
+            source_file=str(source_file),
+            coord_units=coord_units,
+            pixel_size_nm=pixel_size_nm,
+            default_locprec_nm=default_locprec_nm,
+            default_lpx_px=default_lpx_px,
+            napari_units=napari_units,
+            locan_units=locan_units,
+            export_smap_enabled=infer_export_setting(profile, "smap"),
+            export_picasso_enabled=infer_export_setting(profile, "picasso"),
+            export_napari_enabled=infer_export_setting(profile, "napari"),
+            export_locan_enabled=infer_export_setting(profile, "locan"),
         )
 
-        if raw_output is None:
-            return {
-                "backend_status": "pending_no_raw_output",
-                "backend_name": "liteloc",
-                "backend_message": message + " but no raw output was returned",
-                "raw_output_path": "",
-            }
-
-        return {
-            "backend_status": "passed",
-            "backend_name": "liteloc",
-            "backend_message": message,
-            "raw_output_path": str(raw_output),
+        canonical_output_path = post_summary.get("canonical_csv", "")
+        canonical_result = {
+            "canonical_status": "passed" if canonical_output_path else "failed",
+            "canonical_message": "post_inference.run_post_inference completed",
+            "canonical_output_path": canonical_output_path,
+            "post_inference_summary": post_summary.get(
+                "post_inference_summary",
+                str(movie_out_dir / "post_inference_summary.json"),
+            ),
+            "localization_qc": post_summary.get("localization_qc", ""),
         }
-
-    except TypeError:
-        try:
-            raw_output = fn(movie_path, movie_out_dir, profile)
-
-            if raw_output is None:
-                return {
-                    "backend_status": "pending_no_raw_output",
-                    "backend_name": "liteloc",
-                    "backend_message": message + " with positional fallback but no raw output was returned",
-                    "raw_output_path": "",
-                }
-
-            return {
-                "backend_status": "passed",
-                "backend_name": "liteloc",
-                "backend_message": message + " with positional fallback",
-                "raw_output_path": str(raw_output),
-            }
-
-        except Exception as exc:
-            return {
-                "backend_status": "failed",
-                "backend_name": "liteloc",
-                "backend_message": repr(exc),
-                "raw_output_path": "",
-            }
+        export_result = {
+            "status": post_summary.get("status", "unknown"),
+            "exports": post_summary.get("exports", {}),
+            "plots": post_summary.get("plots", {}),
+            "quality_flags": post_summary.get("quality_flags", []),
+            "coord_units_detected": post_summary.get(
+                "coord_units_detected", coord_units
+            ),
+            "pixel_size_nm": post_summary.get("pixel_size_nm", pixel_size_nm),
+        }
+        return post_summary, canonical_result, export_result
 
     except Exception as exc:
+        canonical_result = {
+            "canonical_status": "failed",
+            "canonical_message": repr(exc),
+            "canonical_output_path": "",
+            "post_inference_summary": "",
+            "localization_qc": "",
+        }
+        export_result = {"status": "failed", "error": repr(exc)}
+        return {}, canonical_result, export_result
+
+
+def build_export_validation_map(
+    canonical_path: str | Path | None,
+    export_result: Mapping[str, Any],
+) -> Dict[str, str | Path | None]:
+    exports: Dict[str, str | Path | None] = {"canonical": canonical_path}
+
+    raw_exports = export_result.get("exports", {})
+    if isinstance(raw_exports, Mapping):
+        for key, value in raw_exports.items():
+            if isinstance(value, Mapping):
+                path = value.get("path") or value.get("file") or value.get("output")
+                exports[str(key)] = path
+            else:
+                exports[str(key)] = value  # type: ignore[assignment]
+
+    known_aliases = {
+        "picasso": ["picasso_csv", "picasso_output", "picasso_localizations"],
+        "smap": ["smap_csv", "smap_output", "smap_localizations"],
+        "napari": ["napari_csv", "napari_output", "napari_points"],
+        "locan": ["locan_csv", "locan_output", "locan_localizations"],
+    }
+    for export_name, keys in known_aliases.items():
+        if export_name in exports and exports[export_name]:
+            continue
+        for key in keys:
+            value = export_result.get(key)
+            if value:
+                exports[export_name] = value
+                break
+
+    return exports
+
+
+def combine_outputs_safely(folders: RunFolders) -> Dict[str, Any]:
+    try:
+        from combine_run_outputs import combine_run_outputs
+    except Exception as exc:
         return {
-            "backend_status": "failed",
-            "backend_name": "liteloc",
-            "backend_message": repr(exc),
-            "raw_output_path": "",
+            "status": "not_available",
+            "error": repr(exc),
+            "combined_dir": "",
+            "outputs": {},
         }
 
+    for candidate in [folders.results, folders.parent]:
+        try:
+            result = combine_run_outputs(candidate)
+            if isinstance(result, dict):
+                return result
+            return {"status": "passed", "combined_dir": str(result), "outputs": {}}
+        except Exception as exc:
+            last_error = repr(exc)
+
+    return {
+        "status": "failed",
+        "error": last_error,
+        "combined_dir": "",
+        "outputs": {},
+    }
+
+
+def generate_report_safely(folders: RunFolders) -> Dict[str, Any]:
+    try:
+        from generate_run_report import generate_run_report
+    except Exception as exc:
+        return {"status": "not_available", "error": repr(exc)}
+
+    for candidate in [folders.parent, folders.results]:
+        try:
+            outputs = generate_run_report(candidate)
+            if isinstance(outputs, dict):
+                return {
+                    "status": "passed",
+                    "markdown_report": outputs.get("markdown_report", ""),
+                    "html_report": outputs.get("html_report", ""),
+                    "assets_dir": outputs.get("assets_dir", ""),
+                }
+            return {"status": "passed", "html_report": str(outputs)}
+        except Exception as exc:
+            last_error = repr(exc)
+
+    return {"status": "failed", "error": last_error}
+
 
 # =============================================================================
-# Main pipeline
+# Registry and artifacts
 # =============================================================================
 
-def run_pipeline(
-    input_path: Path,
-    out_dir: Path,
-    profile_path: Path,
-    backend_override: Optional[str] = None,
-    max_files: Optional[int] = None,
-    force: bool = False,
-    coord_units: str = "auto",
-    pixel_size_nm: Optional[float] = None,
-    export_smap_enabled: Optional[bool] = None,
-    export_picasso_enabled: Optional[bool] = None,
-    export_napari_enabled: Optional[bool] = None,
-    export_locan_enabled: Optional[bool] = None,
-    default_locprec_nm: float = 20.0,
-    default_lpx_px: float = 1.0,
-    napari_units: str = "nm",
-    locan_units: str = "nm",
+
+def global_registry_dir(folders: RunFolders) -> Path:
+    """
+    Global registry lives under outputs/registry if the run folder is outputs/<run>.
+    Otherwise it lives next to the chosen parent folder as <parent_parent>/registry.
+    """
+    return folders.parent.parent / "registry"
+
+
+def artifact_id(step: str, folders: RunFolders) -> str:
+    return safe_name(f"{step}_{folders.parent.name}")
+
+
+def load_json_if_exists(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def write_artifact_snapshot(
+    step: str,
+    folders: RunFolders,
+    profile: Mapping[str, Any],
+    backend_name: str,
+    backend_config: Mapping[str, Any],
+    step_result: Mapping[str, Any],
+    status: str,
 ) -> Dict[str, Any]:
-    input_path = input_path.expanduser().resolve()
-    out_dir = out_dir.expanduser().resolve()
-    profile_path = profile_path.expanduser().resolve()
+    profile_path = str(profile.get("profile_path", ""))
+    profile_label = profile_name(profile, Path(profile_path or "profile.yaml"))
+    art_id = artifact_id(step, folders)
 
-    requested_out_dir = out_dir
-    out_dir = get_numbered_out_dir(out_dir, force=force)
+    artifact: Dict[str, Any] = {
+        "id": art_id,
+        "step": step,
+        "status": status,
+        "created_at": now_iso(),
+        "profile_name": profile_label,
+        "profile_path": profile_path,
+        "backend": backend_name,
+        "run_parent": str(folders.parent),
+        "results_dir": str(folders.results),
+        "benchmarks_dir": str(folders.benchmarks),
+        "reports_dir": str(folders.reports),
+        "registry_dir": str(folders.registry),
+        "psf_type": backend_config.get("psf_type")
+        or get_nested(profile, ["psf", "type"], None),
+        "dimensionality": backend_config.get("psf_dimensionality")
+        or get_nested(profile, ["psf", "dimensionality"], None),
+        "backend_config": dict(backend_config),
+        "step_result": dict(step_result),
+    }
 
-    if out_dir != requested_out_dir:
-        print(
-            f"Output directory already exists and is not empty.\n"
-            f"Using new numbered output directory:\n"
-            f"{display_path(out_dir)}\n"
+    if step == "calibrate":
+        artifact["calibration_file"] = step_result.get("calibration_file", "")
+    elif step == "train":
+        artifact["model_path"] = step_result.get("model_path", "")
+        artifact["used_calibration"] = backend_config.get("calibration_file", "")
+    elif step == "infer":
+        artifact["used_model"] = backend_config.get("model_path", "")
+        artifact["used_calibration"] = backend_config.get("calibration_file", "")
+
+    local_artifact_path = folders.registry / "artifact.json"
+    write_json(artifact, local_artifact_path)
+
+    global_dir = global_registry_dir(folders)
+    global_dir.mkdir(parents=True, exist_ok=True)
+    global_artifacts_path = global_dir / "artifacts.json"
+    registry = load_json_if_exists(global_artifacts_path, {"artifacts": []})
+    if not isinstance(registry, dict):
+        registry = {"artifacts": []}
+    artifacts = registry.get("artifacts", [])
+    if not isinstance(artifacts, list):
+        artifacts = []
+
+    artifacts = [
+        item
+        for item in artifacts
+        if not (isinstance(item, dict) and item.get("id") == art_id)
+    ]
+    artifacts.append(artifact)
+    registry["artifacts"] = artifacts
+    registry["updated_at"] = now_iso()
+    write_json(registry, global_artifacts_path)
+
+    if step == "calibrate" and status in {"passed", "warning"}:
+        write_json(artifact, global_dir / "latest_calibration.json")
+    elif step == "train" and status in {"passed", "warning"}:
+        write_json(artifact, global_dir / "latest_model.json")
+
+    return artifact
+
+
+# =============================================================================
+# Command implementations
+# =============================================================================
+
+
+def prepare_run_context(
+    args: argparse.Namespace,
+) -> Tuple[Dict[str, Any], str, RunFolders, Dict[str, Any]]:
+    step = args.command
+    input_path = Path(args.i).expanduser().resolve()
+    profile_path = Path(args.p).expanduser().resolve()
+    profile = load_profile(profile_path)
+    backend_name = get_backend_name(profile, getattr(args, "b", None))
+
+    folders = prepare_parent_run_folder(
+        step=step,
+        input_path=input_path,
+        profile_path=profile_path,
+        output_arg=Path(args.o) if getattr(args, "o", None) else None,
+        name=getattr(args, "name", None),
+        overwrite=bool(getattr(args, "overwrite", False)),
+        dry_run=bool(getattr(args, "dry_run", False)),
+        command=sys.argv,
+        extra_manifest={
+            "backend_name": backend_name,
+            "profile_name": profile_name(profile, profile_path),
+        },
+    )
+
+    backend_config = resolve_backend_runtime_config(
+        step=step,
+        profile=profile,
+        backend_name=backend_name,
+        folders=folders,
+    )
+
+    profile["_runtime"] = {"backend": backend_config}
+    profile["resolved_backend"] = backend_config
+
+    if not getattr(args, "dry_run", False):
+        write_json(backend_config, folders.registry / "resolved_config.json")
+        write_yaml_if_possible(
+            backend_config, folders.registry / "resolved_config.yaml"
         )
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    return profile, backend_name, folders, backend_config
 
-    bench = RuntimeBenchmark(out_dir=out_dir)
 
-    profile = load_profile(profile_path)
-    backend_name = get_backend_name(profile, backend_override)
-    resolved_pixel_size_nm = infer_pixel_size_nm(profile, pixel_size_nm)
-
-    movies = discover_tiff_movies(input_path)
-
-    if max_files is not None:
-        movies = movies[:max_files]
-
-    if not movies:
-        raise RuntimeError(f"No TIFF/OME-TIFF files found in: {input_path}")
-
-    qc_one_movie = get_qc_function()
-    run_post_inference = get_post_inference_function()
-
-    batches_dir = out_dir / "batches"
-    batches_dir.mkdir(parents=True, exist_ok=True)
-
-    rows: List[Dict[str, Any]] = []
-
+def print_header(
+    step: str,
+    input_path: Path,
+    profile_path: Path,
+    folders: RunFolders,
+    backend_name: str,
+    backend_config: Mapping[str, Any],
+    n_movies: Optional[int] = None,
+) -> None:
     print("=" * 70)
-    print("SMLM wrapper pipeline")
+    print(f"SMLM LabFlow pipeline — {step}")
     print("=" * 70)
-    print(f"Input:          {display_path(input_path)}")
-    print(f"Output:         {display_path(out_dir)}")
-    print(f"Profile:        {display_path(profile_path)}")
-    print(f"Backend:        {backend_name}")
-    print(f"Movies:         {len(movies)}")
-    print(f"Coord units:    {coord_units}")
-    print(f"Pixel size nm:  {resolved_pixel_size_nm}")
-    print("Review:         external/manual")
+    print(f"Input:        {display_path(input_path)}")
+    print(f"Run folder:   {display_path(folders.parent)}")
+    print(f"Results:      {display_path(folders.results)}")
+    print(f"Benchmarks:   {display_path(folders.benchmarks)}")
+    print(f"Reports:      {display_path(folders.reports)}")
+    print(f"Registry:     {display_path(folders.registry)}")
+    print(f"Profile:      {display_path(profile_path)}")
+    print(f"Backend:      {backend_name}")
+    print(
+        f"Resolver:     {backend_config.get('resolver_function', backend_config.get('status', ''))}"
+    )
+    print(f"PSF type:     {backend_config.get('psf_type', '')}")
+    print(f"Calibration:  {display_path(backend_config.get('calibration_file', ''))}")
+    print(f"Model:        {display_path(backend_config.get('model_path', ''))}")
+    print(f"Device:       {backend_config.get('device', '')}")
+    if n_movies is not None:
+        print(f"Movies:       {n_movies}")
     print("=" * 70)
     print()
 
+
+def dry_run_result(
+    args: argparse.Namespace,
+    profile: Mapping[str, Any],
+    backend_name: str,
+    folders: RunFolders,
+    backend_config: Mapping[str, Any],
+    movies: Optional[List[Path]] = None,
+) -> Dict[str, Any]:
+    result = {
+        "status": "dry_run",
+        "step": args.command,
+        "message": "No files were written and no backend stages were executed.",
+        "input": str(Path(args.i).expanduser().resolve()),
+        "profile": str(Path(args.p).expanduser().resolve()),
+        "backend_name": backend_name,
+        "run_folder": folders.as_dict(),
+        "resolved_backend_config": dict(backend_config),
+        "profile_name": profile.get("profile_name", ""),
+        "n_movies_detected": len(movies) if movies is not None else None,
+        "movies": [str(movie) for movie in movies] if movies is not None else [],
+    }
+    print_header(
+        step=args.command,
+        input_path=Path(args.i).expanduser().resolve(),
+        profile_path=Path(args.p).expanduser().resolve(),
+        folders=folders,
+        backend_name=backend_name,
+        backend_config=backend_config,
+        n_movies=len(movies) if movies is not None else None,
+    )
+    print("Dry run enabled. Nothing was executed.")
+    print("Planned parent run folder:")
+    print(display_path(folders.parent))
+    print("=" * 70)
+    return result
+
+
+def run_calibrate(args: argparse.Namespace) -> Dict[str, Any]:
+    profile, backend_name, folders, backend_config = prepare_run_context(args)
+    input_path = Path(args.i).expanduser().resolve()
+    profile_path = Path(args.p).expanduser().resolve()
+
+    if args.dry_run:
+        return dry_run_result(args, profile, backend_name, folders, backend_config)
+
+    print_header(
+        "calibrate", input_path, profile_path, folders, backend_name, backend_config
+    )
+    write_run_status(folders, status="running", message="Calibration started.")
+
+    bench = RuntimeBenchmark(out_dir=folders.benchmarks)
+
+    movies = discover_tiff_movies(input_path)
     for index, movie_path in enumerate(movies, start=1):
-        run_id = make_run_id(movie_path, index)
-        movie_out_dir = batches_dir / run_id
-        movie_out_dir.mkdir(parents=True, exist_ok=True)
+        bench.benchmark_input_movie(movie_path, batch_index=index)
+
+    with bench.stage(
+        "backend_calibrate", input_path=input_path, out_dir=folders.results
+    ):
+        backend_result = run_backend_step(
+            step="calibrate",
+            backend_name=backend_name,
+            input_path=input_path,
+            out_dir=folders.results,
+            profile=profile,
+            backend_config=backend_config,
+        )
+
+    benchmark_summary = bench.finalize()
+    status = (
+        "passed"
+        if backend_result.get("calibrate_status") == "passed"
+        or backend_result.get("backend_status") == "passed"
+        else "warning"
+    )
+
+    artifact = write_artifact_snapshot(
+        step="calibrate",
+        folders=folders,
+        profile=profile,
+        backend_name=backend_name,
+        backend_config=backend_config,
+        step_result=backend_result,
+        status=status,
+    )
+
+    summary = {
+        "created_at": now_iso(),
+        "step": "calibrate",
+        "status": status,
+        "input": str(input_path),
+        "profile_path": str(profile_path),
+        "backend_name": backend_name,
+        "run_parent": str(folders.parent),
+        "results_dir": str(folders.results),
+        "benchmarks_dir": str(folders.benchmarks),
+        "reports_dir": str(folders.reports),
+        "registry_dir": str(folders.registry),
+        "n_input_movies": len(movies),
+        "backend_result": backend_result,
+        "benchmark": benchmark_summary,
+        "artifact": artifact,
+    }
+    write_json(summary, folders.results / "calibration_summary.json")
+    write_json(summary, folders.registry / "run_summary.json")
+
+    report = generate_report_safely(folders)
+    summary["report"] = report
+    write_json(summary, folders.registry / "run_summary.json")
+    write_run_status(
+        folders,
+        status=status,
+        message="Calibration completed.",
+        extra={"artifact_id": artifact.get("id")},
+    )
+
+    print_footer(folders, summary)
+    return summary
+
+
+def run_train(args: argparse.Namespace) -> Dict[str, Any]:
+    profile, backend_name, folders, backend_config = prepare_run_context(args)
+    input_path = Path(args.i).expanduser().resolve()
+    profile_path = Path(args.p).expanduser().resolve()
+
+    if args.dry_run:
+        return dry_run_result(args, profile, backend_name, folders, backend_config)
+
+    print_header(
+        "train", input_path, profile_path, folders, backend_name, backend_config
+    )
+    write_run_status(folders, status="running", message="Training started.")
+
+    bench = RuntimeBenchmark(out_dir=folders.benchmarks)
+
+    movies = discover_tiff_movies(input_path)
+    for index, movie_path in enumerate(movies, start=1):
+        bench.benchmark_input_movie(movie_path, batch_index=index)
+
+    with bench.stage("backend_train", input_path=input_path, out_dir=folders.results):
+        backend_result = run_backend_step(
+            step="train",
+            backend_name=backend_name,
+            input_path=input_path,
+            out_dir=folders.results,
+            profile=profile,
+            backend_config=backend_config,
+        )
+
+    benchmark_summary = bench.finalize()
+    status = (
+        "passed"
+        if backend_result.get("train_status") == "passed"
+        or backend_result.get("backend_status") == "passed"
+        else "warning"
+    )
+
+    artifact = write_artifact_snapshot(
+        step="train",
+        folders=folders,
+        profile=profile,
+        backend_name=backend_name,
+        backend_config=backend_config,
+        step_result=backend_result,
+        status=status,
+    )
+
+    summary = {
+        "created_at": now_iso(),
+        "step": "train",
+        "status": status,
+        "input": str(input_path),
+        "profile_path": str(profile_path),
+        "backend_name": backend_name,
+        "run_parent": str(folders.parent),
+        "results_dir": str(folders.results),
+        "benchmarks_dir": str(folders.benchmarks),
+        "reports_dir": str(folders.reports),
+        "registry_dir": str(folders.registry),
+        "n_input_movies": len(movies),
+        "backend_result": backend_result,
+        "benchmark": benchmark_summary,
+        "artifact": artifact,
+    }
+    write_json(summary, folders.results / "training_summary.json")
+    write_json(summary, folders.registry / "run_summary.json")
+
+    report = generate_report_safely(folders)
+    summary["report"] = report
+    write_json(summary, folders.registry / "run_summary.json")
+    write_run_status(
+        folders,
+        status=status,
+        message="Training completed.",
+        extra={"artifact_id": artifact.get("id")},
+    )
+
+    print_footer(folders, summary)
+    return summary
+
+
+def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
+    profile, backend_name, folders, backend_config = prepare_run_context(args)
+    input_path = Path(args.i).expanduser().resolve()
+    profile_path = Path(args.p).expanduser().resolve()
+
+    movies = discover_tiff_movies(input_path, max_files=args.max_files)
+    if not movies:
+        raise RuntimeError(f"No TIFF/OME-TIFF files found in: {input_path}")
+
+    if args.dry_run:
+        return dry_run_result(
+            args, profile, backend_name, folders, backend_config, movies=movies
+        )
+
+    print_header(
+        "infer",
+        input_path,
+        profile_path,
+        folders,
+        backend_name,
+        backend_config,
+        n_movies=len(movies),
+    )
+    write_run_status(folders, status="running", message="Inference started.")
+
+    bench = RuntimeBenchmark(out_dir=folders.benchmarks)
+    qc_one_movie = get_qc_function()
+    run_post_inference = get_post_inference_function()
+
+    coord_units = infer_coord_units(profile)
+    pixel_size_nm = infer_pixel_size_nm(profile)
+    default_locprec_nm = infer_default_locprec_nm(profile)
+    default_lpx_px = infer_default_lpx_px(profile)
+    napari_units = str(get_nested(profile, ["downstream", "napari_units"], "nm"))
+    locan_units = str(get_nested(profile, ["downstream", "locan_units"], "nm"))
+
+    batches_dir = folders.results / "batches"
+    batches_dir.mkdir(parents=True, exist_ok=True)
+    rows: List[Dict[str, Any]] = []
+
+    for index, movie_path in enumerate(movies, start=1):
+        batch_id = make_batch_id(movie_path, index)
+        batch_out_dir = batches_dir / batch_id
+        batch_out_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"[{index}/{len(movies)}] {movie_path.name}")
 
         base_row: Dict[str, Any] = {
             "batch_index": index,
-            "run_id": run_id,
+            "batch_id": batch_id,
             "input_path": str(movie_path),
             "input_name": movie_path.name,
             "input_parent": str(movie_path.parent),
-            "run_dir": str(movie_out_dir),
+            "batch_dir": str(batch_out_dir),
             "profile_path": str(profile_path),
             "backend_name": backend_name,
             "coord_units_requested": coord_units,
-            "pixel_size_nm": resolved_pixel_size_nm,
+            "pixel_size_nm": pixel_size_nm,
             "review_mode": "external_manual",
-            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "created_at": now_iso(),
+            "resolver_status": backend_config.get("status", ""),
+            "resolver_function": backend_config.get("resolver_function", ""),
+            "psf_type": backend_config.get("psf_type", ""),
+            "psf_dimensionality": backend_config.get("psf_dimensionality", ""),
+            "calibration_file": backend_config.get("calibration_file", ""),
+            "model_path": backend_config.get("model_path", ""),
+            "device": backend_config.get("device", ""),
+            "batch_size": backend_config.get("batch_size", ""),
+            "threshold": backend_config.get("threshold", ""),
         }
 
-        # -----------------------------------------------------------------
-        # QC stage
-        # -----------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Input QC
+        # ------------------------------------------------------------------
+        with bench.stage(
+            "input_qc", batch_index=index, input_path=movie_path, out_dir=batch_out_dir
+        ):
+            qc_result = run_qc_safely(qc_one_movie, movie_path, batch_out_dir)
 
-        try:
-            with bench.stage(
-                "qc",
-                batch_index=index,
-                input_path=movie_path,
-                out_dir=movie_out_dir,
-            ):
-                qc_result = qc_one_movie(
-                    input_path=movie_path,
-                    out_dir=movie_out_dir,
-                )
-
-        except TypeError:
-            try:
-                with bench.stage(
-                    "qc",
-                    batch_index=index,
-                    input_path=movie_path,
-                    out_dir=movie_out_dir,
-                ):
-                    qc_result = qc_one_movie(movie_path, movie_out_dir)
-
-            except Exception as exc:
-                qc_result = {
-                    "qc_status": "failed",
-                    "qc_error": repr(exc),
-                }
-
-        except Exception as exc:
-            qc_result = {
-                "qc_status": "failed",
-                "qc_error": repr(exc),
-            }
-
+        bench.benchmark_input_movie(movie_path, batch_index=index)
         qc_status = qc_result.get("qc_status", "unknown")
         print(f"    QC: {qc_status}")
-
-        # -----------------------------------------------------------------
-        # Backend + post-inference stages
-        # -----------------------------------------------------------------
 
         if qc_status != "passed":
             backend_result = {
@@ -607,7 +1451,6 @@ def run_pipeline(
                 "backend_message": "QC failed; backend skipped.",
                 "raw_output_path": "",
             }
-
             canonical_result = {
                 "canonical_status": "skipped_qc_failed",
                 "canonical_message": "QC failed; post-inference skipped.",
@@ -615,107 +1458,76 @@ def run_pipeline(
                 "post_inference_summary": "",
                 "localization_qc": "",
             }
-
-            export_result = {
-                "status": "skipped_qc_failed",
-                "message": "QC failed; downstream export skipped.",
-            }
-
+            export_result = {"status": "skipped_qc_failed"}
             print("    Backend: skipped_qc_failed")
             print("    Post-inference: skipped_qc_failed")
-            print("    Review: external_manual")
 
         else:
+            # --------------------------------------------------------------
+            # Backend inference
+            # --------------------------------------------------------------
             with bench.stage(
-                "backend_liteloc",
+                "backend_inference",
                 batch_index=index,
                 input_path=movie_path,
-                out_dir=movie_out_dir,
+                out_dir=batch_out_dir,
             ):
-                backend_result = run_backend_if_available(
+                backend_result = run_backend_step(
+                    step="infer",
                     backend_name=backend_name,
-                    movie_path=movie_path,
-                    movie_out_dir=movie_out_dir,
+                    input_path=movie_path,
+                    out_dir=batch_out_dir,
                     profile=profile,
+                    backend_config=backend_config,
+                    batch_index=index,
                 )
 
             print(f"    Backend: {backend_result.get('backend_status')}")
-
             raw_output_path = backend_result.get("raw_output_path", "")
 
             if raw_output_path:
-                try:
-                    with bench.stage(
-                        "post_inference",
-                        batch_index=index,
-                        input_path=raw_output_path,
-                        out_dir=movie_out_dir,
-                    ):
-                        post_summary = run_post_inference(
-                            input_path=raw_output_path,
-                            out_dir=movie_out_dir,
+                # ----------------------------------------------------------
+                # Post-inference conversion + exports
+                # ----------------------------------------------------------
+                with bench.stage(
+                    "post_inference",
+                    batch_index=index,
+                    input_path=raw_output_path,
+                    out_dir=batch_out_dir,
+                ):
+                    post_summary, canonical_result, export_result = (
+                        run_post_inference_safely(
+                            run_post_inference=run_post_inference,
+                            raw_output_path=raw_output_path,
+                            movie_out_dir=batch_out_dir,
                             profile=profile,
                             backend_name=backend_name,
-                            source_file=str(movie_path),
+                            source_file=movie_path,
                             coord_units=coord_units,
-                            pixel_size_nm=resolved_pixel_size_nm,
+                            pixel_size_nm=pixel_size_nm,
                             default_locprec_nm=default_locprec_nm,
                             default_lpx_px=default_lpx_px,
                             napari_units=napari_units,
                             locan_units=locan_units,
-                            export_smap_enabled=export_smap_enabled,
-                            export_picasso_enabled=export_picasso_enabled,
-                            export_napari_enabled=export_napari_enabled,
-                            export_locan_enabled=export_locan_enabled,
                         )
+                    )
 
-                    canonical_output_path = post_summary.get("canonical_csv", "")
-
-                    canonical_result = {
-                        "canonical_status": "passed" if canonical_output_path else "failed",
-                        "canonical_message": "post_inference.run_post_inference completed",
-                        "canonical_output_path": canonical_output_path,
-                        "post_inference_summary": post_summary.get(
-                            "post_inference_summary",
-                            str(movie_out_dir / "post_inference_summary.json"),
+                canonical_path = canonical_result.get("canonical_output_path", "")
+                if canonical_path:
+                    bench.benchmark_localizations(
+                        canonical_csv=canonical_path,
+                        batch_index=index,
+                        coordinate_units=export_result.get(
+                            "coord_units_detected", coord_units
                         ),
-                        "localization_qc": post_summary.get("localization_qc", ""),
-                    }
+                        pixel_size_nm=export_result.get("pixel_size_nm", pixel_size_nm),
+                    )
 
-                    export_result = {
-                        "status": post_summary.get("status", "unknown"),
-                        "exports": post_summary.get("exports", {}),
-                        "plots": post_summary.get("plots", {}),
-                        "quality_flags": post_summary.get("quality_flags", []),
-                        "coord_units_detected": post_summary.get(
-                            "coord_units_detected",
-                            coord_units,
-                        ),
-                        "pixel_size_nm": post_summary.get(
-                            "pixel_size_nm",
-                            resolved_pixel_size_nm,
-                        ),
-                    }
-
-                except Exception as exc:
-                    post_summary = {}
-
-                    canonical_result = {
-                        "canonical_status": "failed",
-                        "canonical_message": repr(exc),
-                        "canonical_output_path": "",
-                        "post_inference_summary": "",
-                        "localization_qc": "",
-                    }
-
-                    export_result = {
-                        "status": "failed",
-                        "error": repr(exc),
-                    }
-
+                    export_validation_map = build_export_validation_map(
+                        canonical_path, export_result
+                    )
+                    bench.validate_exports(export_validation_map)
             else:
-                post_summary = {}
-
                 canonical_result = {
                     "canonical_status": "skipped_no_raw_output",
                     "canonical_message": "No raw backend output available for post-inference.",
@@ -723,40 +1535,31 @@ def run_pipeline(
                     "post_inference_summary": "",
                     "localization_qc": "",
                 }
-
-                export_result = {
-                    "status": "skipped_no_raw_output",
-                }
+                export_result = {"status": "skipped_no_raw_output"}
 
             print(f"    Post-inference: {export_result.get('status')}")
-            print("    Review: external_manual")
-
-        # -----------------------------------------------------------------
-        # Manifest row
-        # -----------------------------------------------------------------
 
         row: Dict[str, Any] = {}
         row.update(base_row)
-
         row["qc_status"] = qc_result.get("qc_status", "")
-        row["qc_json"] = qc_result.get("qc_json", str(movie_out_dir / "input_qc.json"))
-        row["qc_preview"] = qc_result.get("preview_png", str(movie_out_dir / "input_preview.png"))
-        row["qc_histogram"] = qc_result.get("histogram_png", str(movie_out_dir / "input_histogram.png"))
+        row["qc_json"] = qc_result.get("qc_json", str(batch_out_dir / "input_qc.json"))
+        row["qc_preview"] = qc_result.get(
+            "preview_png", str(batch_out_dir / "input_preview.png")
+        )
+        row["qc_histogram"] = qc_result.get(
+            "histogram_png", str(batch_out_dir / "input_histogram.png")
+        )
         row["shape"] = qc_result.get("shape", "")
         row["axes"] = qc_result.get("axes", "")
         row["dtype"] = qc_result.get("dtype", "")
         row["n_frames_guess"] = qc_result.get("n_frames_guess", "")
         row["frame_guess_confidence"] = qc_result.get("frame_guess_confidence", "")
         row["qc_full_result"] = qc_result
-
         row.update(backend_result)
         row.update(canonical_result)
-
         row["post_inference_status"] = export_result.get("status", "")
         row["downstream_export_status"] = export_result.get("status", "")
         row["downstream_export_result"] = export_result
-        row["post_inference_summary"] = canonical_result.get("post_inference_summary", "")
-        row["localization_qc"] = canonical_result.get("localization_qc", "")
         row["review_status"] = "external_manual"
         row["review_result"] = {
             "status": "external_manual",
@@ -765,349 +1568,232 @@ def run_pipeline(
                 "Use napari_locan_review.py separately in napari_locan_env."
             ),
         }
-
         rows.append(row)
         print()
 
-    # =========================================================================
-    # Save manifests and benchmark
-    # =========================================================================
-
-    manifest_csv = out_dir / "batch_manifest.csv"
-    manifest_json = out_dir / "batch_manifest.json"
-    summary_json = out_dir / "run_summary.json"
-
+    manifest_csv = folders.results / "batch_manifest.csv"
+    manifest_json = folders.results / "batch_manifest.json"
+    summary_json = folders.results / "run_summary.json"
     write_manifest_csv(rows, manifest_csv)
     write_json(rows, manifest_json)
 
     benchmark_summary = bench.finalize()
-
-    # =========================================================================
-    # Create top-level combined exports
-    # =========================================================================
-
-    try:
-        from combine_run_outputs import combine_run_outputs
-
-        combined_exports = combine_run_outputs(out_dir)
-
-    except Exception as exc:
-        combined_exports = {
-            "status": "failed",
-            "error": repr(exc),
-            "combined_dir": "",
-            "outputs": {},
-        }
-
-    # =========================================================================
-    # Save summary
-    # =========================================================================
+    combined_exports = combine_outputs_safely(folders)
 
     summary = {
-        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "created_at": now_iso(),
+        "step": "infer",
         "input": str(input_path),
-        "requested_out_dir": str(requested_out_dir),
-        "out_dir": str(out_dir),
+        "run_parent": str(folders.parent),
+        "results_dir": str(folders.results),
+        "benchmarks_dir": str(folders.benchmarks),
+        "reports_dir": str(folders.reports),
+        "registry_dir": str(folders.registry),
         "profile_path": str(profile_path),
         "backend_name": backend_name,
         "coord_units_requested": coord_units,
-        "pixel_size_nm": resolved_pixel_size_nm,
+        "pixel_size_nm": pixel_size_nm,
         "review_mode": "external_manual",
         "n_movies": len(rows),
-
         "qc_passed": sum(row.get("qc_status") == "passed" for row in rows),
         "qc_failed": sum(row.get("qc_status") == "failed" for row in rows),
-
         "backend_passed": sum(row.get("backend_status") == "passed" for row in rows),
         "backend_failed": sum(row.get("backend_status") == "failed" for row in rows),
-        "backend_pending_adapter_missing": sum(
-            row.get("backend_status") == "pending_adapter_missing"
-            for row in rows
-        ),
-
         "canonical_passed": sum(
-            row.get("canonical_status") == "passed"
-            for row in rows
+            row.get("canonical_status") == "passed" for row in rows
         ),
         "canonical_failed": sum(
-            row.get("canonical_status") == "failed"
-            for row in rows
+            row.get("canonical_status") == "failed" for row in rows
         ),
-
         "post_inference_passed": sum(
-            row.get("post_inference_status") in {"passed", "warning"}
-            for row in rows
+            row.get("post_inference_status") in {"passed", "warning"} for row in rows
         ),
         "post_inference_failed": sum(
-            row.get("post_inference_status") == "failed"
-            for row in rows
+            row.get("post_inference_status") == "failed" for row in rows
         ),
-
         "manifest_csv": str(manifest_csv),
         "manifest_json": str(manifest_json),
         "summary_json": str(summary_json),
         "benchmark": benchmark_summary,
         "combined_exports": combined_exports,
+        "resolved_backend_config": backend_config,
     }
 
-    write_json(summary, summary_json)
+    status = "passed"
+    if (
+        summary["qc_failed"]
+        or summary["backend_failed"]
+        or summary["canonical_failed"]
+        or summary["post_inference_failed"]
+    ):
+        status = "warning"
+    summary["status"] = status
 
-    # =========================================================================
-    # Generate supervisor-friendly report
-    # =========================================================================
-
-    try:
-        from generate_run_report import generate_run_report
-
-        report_outputs = generate_run_report(out_dir)
-
-        summary["report"] = {
-            "status": "passed",
-            "markdown_report": report_outputs.get("markdown_report", ""),
-            "html_report": report_outputs.get("html_report", ""),
-            "assets_dir": report_outputs.get("assets_dir", ""),
-        }
-
-    except Exception as exc:
-        summary["report"] = {
-            "status": "failed",
-            "error": repr(exc),
-        }
+    artifact = write_artifact_snapshot(
+        step="infer",
+        folders=folders,
+        profile=profile,
+        backend_name=backend_name,
+        backend_config=backend_config,
+        step_result=summary,
+        status=status,
+    )
+    summary["artifact"] = artifact
 
     write_json(summary, summary_json)
+    write_json(summary, folders.registry / "run_summary.json")
 
-    # =========================================================================
-    # Final terminal output
-    # =========================================================================
+    report = generate_report_safely(folders)
+    summary["report"] = report
+    write_json(summary, summary_json)
+    write_json(summary, folders.registry / "run_summary.json")
+    write_run_status(
+        folders,
+        status=status,
+        message="Inference completed.",
+        extra={"artifact_id": artifact.get("id")},
+    )
 
+    print_footer(folders, summary)
+    return summary
+
+
+# =============================================================================
+# Terminal footer
+# =============================================================================
+
+
+def print_footer(folders: RunFolders, summary: Mapping[str, Any]) -> None:
     print("=" * 70)
     print("Pipeline complete")
     print("=" * 70)
+    print(f"Status:        {summary.get('status', '')}")
+    print(f"Run folder:    {display_path(folders.parent)}")
+    print(f"Results:       {display_path(folders.results)}")
+    print(f"Benchmarks:    {display_path(folders.benchmarks)}")
+    print(f"Reports:       {display_path(folders.reports)}")
+    print(f"Registry:      {display_path(folders.registry)}")
 
-    print(f"Manifest CSV:      {display_path(manifest_csv)}")
-    print(f"Manifest JSON:     {display_path(manifest_json)}")
-    print(f"Summary JSON:      {display_path(summary_json)}")
-
-    if isinstance(benchmark_summary, dict):
-        benchmark_csv = benchmark_summary.get("benchmark_csv", "")
-        benchmark_json = benchmark_summary.get("benchmark_json", "")
-
-        print(f"Benchmark CSV:     {display_path(benchmark_csv) if benchmark_csv else ''}")
-        print(f"Benchmark JSON:    {display_path(benchmark_json) if benchmark_json else ''}")
-    else:
-        print("Benchmark:         unavailable")
+    benchmark = summary.get("benchmark", {})
+    if isinstance(benchmark, Mapping):
+        files = (
+            benchmark.get("files", {})
+            if isinstance(benchmark.get("files", {}), Mapping)
+            else {}
+        )
+        runtime_csv = (
+            files.get("runtime_csv")
+            or benchmark.get("benchmark_csv")
+            or benchmark.get("runtime", {}).get("runtime_csv", "")
+            if isinstance(benchmark.get("runtime", {}), Mapping)
+            else ""
+        )
+        summary_json = files.get("benchmark_summary_json") or ""
+        if runtime_csv:
+            print(f"Runtime CSV:   {display_path(runtime_csv)}")
+        if summary_json:
+            print(f"Benchmark JSON:{display_path(summary_json)}")
 
     report = summary.get("report", {})
-
-    if report.get("status") == "passed":
-        markdown_report = report.get("markdown_report", "")
-        html_report = report.get("html_report", "")
-        assets_dir = report.get("assets_dir", "")
-
-        print(f"Report Markdown:   {display_path(markdown_report) if markdown_report else ''}")
-        print(f"Report HTML:       {display_path(html_report) if html_report else ''}")
-        print(f"Report assets:     {display_path(assets_dir) if assets_dir else ''}")
-    else:
-        print("Report generation: failed")
-        print(f"Report error:      {report.get('error', '')}")
-
-    combined_exports_safe = summary.get("combined_exports", {})
-    combined_outputs = combined_exports_safe.get("outputs", {})
-
-    if combined_outputs:
-        combined_dir = combined_exports_safe.get("combined_dir", "")
-        print(f"Combined exports:  {display_path(combined_dir) if combined_dir else ''}")
-
-        known_keys = [
-            "canonical_all_localizations",
-            "smap_all_localizations",
-            "picasso_all_localizations",
-            "napari_all_points",
-            "locan_all_localizations",
-            "downstream_exports_index",
-            "combined_export_report",
-        ]
-
-        printed = set()
-
-        for key in known_keys:
-            value = combined_outputs.get(key, "")
-
-            if value:
-                label = key.replace("_", " ").title()
-                print(f"{label + ':':<25} {display_path(value)}")
-                printed.add(key)
-
-        for key, value in combined_outputs.items():
-            if key in printed:
-                continue
-
-            label = key.replace("_", " ").title()
-
-            if isinstance(value, str) and value:
-                print(f"{label + ':':<25} {display_path(value)}")
-            else:
-                print(f"{label + ':':<25} {value}")
-    else:
-        print("Combined exports:  none")
+    if isinstance(report, Mapping):
+        if report.get("html_report"):
+            print(f"HTML report:   {display_path(report.get('html_report'))}")
+        elif report.get("status") not in {"passed", None}:
+            print(f"Report:        {report.get('status')} {report.get('error', '')}")
 
     print("=" * 70)
-
-    return summary
 
 
 # =============================================================================
 # CLI
 # =============================================================================
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(
-            "SMLM wrapper pipeline with automatic QC, LiteLoc backend, "
-            "post-inference adapted exports, combined outputs, and runtime benchmark."
-        )
-    )
 
+def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
-        "--input",
+        "-i",
         required=True,
         help="Input TIFF/OME-TIFF file or folder.",
     )
-
     parser.add_argument(
-        "--out",
+        "-p",
         required=True,
-        help="Output run folder.",
+        help="Profile YAML path.",
     )
-
     parser.add_argument(
-        "--profile",
-        required=True,
-        help="YAML profile path.",
-    )
-
-    parser.add_argument(
-        "--backend",
+        "-o",
         default=None,
-        help="Optional backend override. Default comes from profile.",
+        help="Parent run folder. The pipeline creates results/, benchmarks/, reports/, and registry/ inside it.",
+    )
+    parser.add_argument(
+        "-b",
+        default=None,
+        help="Optional backend override. Default comes from profile, usually liteloc.",
+    )
+    parser.add_argument(
+        "--name",
+        default=None,
+        help="Optional friendly run name used only when -o is not provided.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview what would happen without creating folders or running backend stages.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Allow reuse of a non-empty -o folder. Use carefully.",
     )
 
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="run_pipeline.py",
+        description=(
+            "SMLM LabFlow pipeline. Use one of: calibrate, train, infer. "
+            "The public CLI is intentionally small for lab users."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        allow_abbrev=False,
+    )
     parser.add_argument(
+        "--version",
+        action="version",
+        version="SMLM LabFlow pipeline 0.2",
+    )
+
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+        metavar="{calibrate,train,infer}",
+    )
+
+    calibrate_parser = subparsers.add_parser(
+        "calibrate",
+        help="Create/update PSF calibration artifacts from bead/calibration data.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    add_common_args(calibrate_parser)
+
+    train_parser = subparsers.add_parser(
+        "train",
+        help="Train a backend model using the latest compatible calibration from the registry.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    add_common_args(train_parser)
+
+    infer_parser = subparsers.add_parser(
+        "infer",
+        help="Run inference on raw SMLM movies using the latest compatible model from the registry.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    add_common_args(infer_parser)
+    infer_parser.add_argument(
         "--max-files",
         type=int,
         default=None,
-        help="Optional test limit.",
-    )
-
-    parser.add_argument(
-        "--force",
-        action="store_true",
-        help="Allow reuse of non-empty output folder.",
-    )
-
-    parser.add_argument(
-        "--coord-units",
-        choices=["auto", "nm", "pixel"],
-        default="auto",
-        help="Units of localization coordinates after inference.",
-    )
-
-    parser.add_argument(
-        "--pixel-size-nm",
-        type=float,
-        default=None,
-        help="Camera pixel size in nm for nm/pixel downstream conversion.",
-    )
-
-    parser.add_argument(
-        "--default-locprec-nm",
-        type=float,
-        default=20.0,
-        help="Default localization precision in nm for SMAP export when lpx/lpy are missing.",
-    )
-
-    parser.add_argument(
-        "--default-lpx-px",
-        type=float,
-        default=1.0,
-        help="Default localization precision in pixels for Picasso export when lpx/lpy are missing.",
-    )
-
-    parser.add_argument(
-        "--napari-units",
-        choices=["nm", "pixel"],
-        default="nm",
-        help="Coordinate units written to napari CSV export from post_inference.",
-    )
-
-    parser.add_argument(
-        "--locan-units",
-        choices=["nm", "pixel"],
-        default="nm",
-        help="Coordinate units written to Locan CSV export from post_inference.",
-    )
-
-    smap_group = parser.add_mutually_exclusive_group()
-    smap_group.add_argument(
-        "--export-smap",
-        dest="export_smap",
-        action="store_true",
-        help="Force SMAP-adapted CSV export.",
-    )
-    smap_group.add_argument(
-        "--no-smap",
-        dest="export_smap",
-        action="store_false",
-        help="Disable SMAP-adapted CSV export.",
-    )
-
-    picasso_group = parser.add_mutually_exclusive_group()
-    picasso_group.add_argument(
-        "--export-picasso",
-        dest="export_picasso",
-        action="store_true",
-        help="Force Picasso-adapted CSV export.",
-    )
-    picasso_group.add_argument(
-        "--no-picasso",
-        dest="export_picasso",
-        action="store_false",
-        help="Disable Picasso-adapted CSV export.",
-    )
-
-    napari_group = parser.add_mutually_exclusive_group()
-    napari_group.add_argument(
-        "--export-napari",
-        dest="export_napari",
-        action="store_true",
-        help="Force napari points CSV export.",
-    )
-    napari_group.add_argument(
-        "--no-napari",
-        dest="export_napari",
-        action="store_false",
-        help="Disable napari points CSV export.",
-    )
-
-    locan_group = parser.add_mutually_exclusive_group()
-    locan_group.add_argument(
-        "--export-locan",
-        dest="export_locan",
-        action="store_true",
-        help="Force Locan-style CSV export.",
-    )
-    locan_group.add_argument(
-        "--no-locan",
-        dest="export_locan",
-        action="store_false",
-        help="Disable Locan-style CSV export.",
-    )
-
-    parser.set_defaults(
-        export_smap=None,
-        export_picasso=None,
-        export_napari=None,
-        export_locan=None,
+        help="Optional quick test limit for inference.",
     )
 
     return parser
@@ -1118,25 +1804,18 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        run_pipeline(
-            input_path=Path(args.input),
-            out_dir=Path(args.out),
-            profile_path=Path(args.profile),
-            backend_override=args.backend,
-            max_files=args.max_files,
-            force=args.force,
-            coord_units=args.coord_units,
-            pixel_size_nm=args.pixel_size_nm,
-            export_smap_enabled=args.export_smap,
-            export_picasso_enabled=args.export_picasso,
-            export_napari_enabled=args.export_napari,
-            export_locan_enabled=args.export_locan,
-            default_locprec_nm=args.default_locprec_nm,
-            default_lpx_px=args.default_lpx_px,
-            napari_units=args.napari_units,
-            locan_units=args.locan_units,
-        )
+        if args.command == "calibrate":
+            run_calibrate(args)
+        elif args.command == "train":
+            run_train(args)
+        elif args.command == "infer":
+            run_infer(args)
+        else:
+            parser.error(f"Unknown command: {args.command}")
 
+    except KeyboardInterrupt:
+        print("\nPipeline interrupted by user.")
+        sys.exit(130)
     except Exception as exc:
         print("\nPipeline failed.")
         print(f"Error: {repr(exc)}")

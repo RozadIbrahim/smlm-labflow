@@ -182,9 +182,7 @@ class LiteLocRuntime:
     backend_config: Dict[str, Any]
 
 
-def _candidate_root_values(
-    profile: Mapping[str, Any], backend_config: Mapping[str, Any]
-) -> List[Any]:
+def _candidate_root_values(profile: Mapping[str, Any], backend_config: Mapping[str, Any]) -> List[Any]:
     return [
         backend_config.get("liteloc_root"),
         backend_config.get("root"),
@@ -204,12 +202,7 @@ def _candidate_port_values(
     step: str,
 ) -> List[Any]:
     aliases = {
-        "calibrate": [
-            "calibrate",
-            "calibration",
-            "calibrate_script",
-            "calibration_script",
-        ],
+        "calibrate": ["calibrate", "calibration", "calibrate_script", "calibration_script"],
         "train": ["train", "training", "train_script", "training_script"],
         "infer": ["infer", "inference", "infer_script", "inference_script"],
     }[step]
@@ -295,9 +288,7 @@ def runtime_from_old_config_resolver() -> Optional[LiteLocRuntime]:
         ports = LiteLocPorts(
             infer=optional_path(getattr(ports_obj, "infer", None), base_dir=repo_dir),
             train=optional_path(getattr(ports_obj, "train", None), base_dir=repo_dir),
-            calibrate=optional_path(
-                getattr(ports_obj, "calibrate", None), base_dir=repo_dir
-            ),
+            calibrate=optional_path(getattr(ports_obj, "calibrate", None), base_dir=repo_dir),
         )
         return LiteLocRuntime(
             repo_dir=repo_dir,
@@ -347,22 +338,19 @@ def resolve_liteloc_runtime(
 
     ports = LiteLocPorts(
         infer=_resolve_first_existing_path(
-            list(_candidate_port_values(profile, backend_config, "infer"))
-            + [_default_port_for_step("infer")],
+            list(_candidate_port_values(profile, backend_config, "infer")) + [_default_port_for_step("infer")],
             base_dir=repo_dir,
             required=False,
             label="LiteLoc inference port",
         ),
         train=_resolve_first_existing_path(
-            list(_candidate_port_values(profile, backend_config, "train"))
-            + [_default_port_for_step("train")],
+            list(_candidate_port_values(profile, backend_config, "train")) + [_default_port_for_step("train")],
             base_dir=repo_dir,
             required=False,
             label="LiteLoc training port",
         ),
         calibrate=_resolve_first_existing_path(
-            list(_candidate_port_values(profile, backend_config, "calibrate"))
-            + [_default_port_for_step("calibrate")],
+            list(_candidate_port_values(profile, backend_config, "calibrate")) + [_default_port_for_step("calibrate")],
             base_dir=repo_dir,
             required=False,
             label="LiteLoc calibration port",
@@ -405,9 +393,7 @@ def find_new_artifact(
                 continue
             if path.suffix.lower() not in suffixes:
                 continue
-            if name_tokens and not any(
-                token in path.name.lower() for token in name_tokens
-            ):
+            if name_tokens and not any(token in path.name.lower() for token in name_tokens):
                 continue
             candidates.append(resolved)
 
@@ -417,9 +403,7 @@ def find_new_artifact(
     return sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)[0]
 
 
-def copy_artifact_to_out_dir(
-    artifact: Optional[Path], out_dir: Path, preferred_name: Optional[str] = None
-) -> str:
+def copy_artifact_to_out_dir(artifact: Optional[Path], out_dir: Path, preferred_name: Optional[str] = None) -> str:
     if artifact is None:
         return ""
 
@@ -496,16 +480,10 @@ def load_base_liteloc_yaml(base_yaml_path: Path) -> Dict[str, Any]:
 
 
 def detect_infer_execution(profile: Dict[str, Any], infer_port: Optional[Path]) -> str:
-    value = (
-        str(get_nested(profile, "liteloc", "infer_execution", default="auto"))
-        .lower()
-        .strip()
-    )
+    value = str(get_nested(profile, "liteloc", "infer_execution", default="auto")).lower().strip()
 
     if value not in {"auto", "script", "module"}:
-        raise ValueError(
-            "Invalid liteloc.infer_execution. Expected auto, script, or module."
-        )
+        raise ValueError("Invalid liteloc.infer_execution. Expected auto, script, or module.")
 
     if value in {"script", "module"}:
         return value
@@ -513,10 +491,7 @@ def detect_infer_execution(profile: Dict[str, Any], infer_port: Optional[Path]) 
     if infer_port is None:
         return "script"
 
-    if (
-        infer_port.name.lower() == "multi_process.py"
-        or infer_port.parent.name.lower() == "network"
-    ):
+    if infer_port.name.lower() == "multi_process.py" or infer_port.parent.name.lower() == "network":
         return "module"
 
     return "script"
@@ -559,12 +534,8 @@ def build_runtime_liteloc_infer_yaml(
     if not model_path.exists():
         raise FileNotFoundError(f"LiteLoc model checkpoint not found: {model_path}")
 
-    raw_output_name = get_nested(
-        profile, "output", "raw_output_name", default="liteloc_raw_output.csv"
-    )
-    runtime_yaml_name = get_nested(
-        profile, "output", "runtime_yaml_name", default="runtime_liteloc_infer.yaml"
-    )
+    raw_output_name = get_nested(profile, "output", "raw_output_name", default="liteloc_raw_output.csv")
+    runtime_yaml_name = get_nested(profile, "output", "runtime_yaml_name", default="runtime_liteloc_infer.yaml")
 
     raw_output_path = out_dir / str(raw_output_name)
     runtime_yaml_path = out_dir / str(runtime_yaml_name)
@@ -709,9 +680,7 @@ def build_calibration_script_args(
     Backend config override:
         calibration_args: [...]
     """
-    raw_args = backend_config.get("calibration_args") or get_nested(
-        profile, "liteloc", "calibration_args", default=[]
-    )
+    raw_args = backend_config.get("calibration_args") or get_nested(profile, "liteloc", "calibration_args", default=[])
     if not raw_args:
         return []
     if not isinstance(raw_args, list):
@@ -852,9 +821,7 @@ def build_training_script_args(
     profile: Dict[str, Any],
     backend_config: Dict[str, Any],
 ) -> List[str]:
-    raw_args = backend_config.get("training_args") or get_nested(
-        profile, "liteloc", "training_args", default=[]
-    )
+    raw_args = backend_config.get("training_args") or get_nested(profile, "liteloc", "training_args", default=[])
     if not raw_args:
         return []
     if not isinstance(raw_args, list):
@@ -913,12 +880,7 @@ def run_liteloc_training(
     env["LITELOC_TRAINING_OUTPUT"] = str(out_dir)
     env["LITELOC_RUN_OUTPUT"] = str(out_dir)
 
-    search_dirs = [
-        out_dir,
-        repo_dir / "results",
-        repo_dir / "outputs",
-        train_port.parent,
-    ]
+    search_dirs = [out_dir, repo_dir / "results", repo_dir / "outputs", train_port.parent]
     before_files = set()
     for folder in search_dirs:
         before_files |= snapshot_files(folder)
@@ -1006,14 +968,12 @@ def run_liteloc_one_movie(
         )
 
     env = add_liteloc_to_syspath_and_env(repo_dir)
-    runtime_yaml_path, raw_output_path, resolved_runtime = (
-        build_runtime_liteloc_infer_yaml(
-            input_path=input_path,
-            out_dir=out_dir,
-            profile=profile,
-            repo_dir=repo_dir,
-            backend_config=backend_config,
-        )
+    runtime_yaml_path, raw_output_path, resolved_runtime = build_runtime_liteloc_infer_yaml(
+        input_path=input_path,
+        out_dir=out_dir,
+        profile=profile,
+        repo_dir=repo_dir,
+        backend_config=backend_config,
     )
 
     log_name = get_nested(profile, "output", "log_name", default="liteloc.log")
@@ -1025,12 +985,7 @@ def run_liteloc_one_movie(
         "created_at": now_iso(),
         "backend": "liteloc",
         "adapter": "general_liteloc_adapter",
-        "variant": get_nested(
-            profile,
-            "backend",
-            "variant",
-            default=get_nested(profile, "psf", "family", default="unspecified"),
-        ),
+        "variant": get_nested(profile, "backend", "variant", default=get_nested(profile, "psf", "family", default="unspecified")),
         "input_path": str(input_path),
         "out_dir": str(out_dir),
         "repo_dir": str(repo_dir),
@@ -1073,19 +1028,10 @@ def run_liteloc_one_movie(
                 log_path=log_path,
             )
         else:
-            raise RuntimeError(
-                f"Unsupported LiteLoc infer execution mode: {infer_execution}"
-            )
+            raise RuntimeError(f"Unsupported LiteLoc infer execution mode: {infer_execution}")
     except Exception as exc:
         elapsed_seconds = round(time.time() - start_time, 2)
-        status.update(
-            {
-                "status": "failed_exception",
-                "return_code": None,
-                "elapsed_seconds": elapsed_seconds,
-                "message": repr(exc),
-            }
-        )
+        status.update({"status": "failed_exception", "return_code": None, "elapsed_seconds": elapsed_seconds, "message": repr(exc)})
         write_json(status, status_path)
         raise
 
@@ -1093,33 +1039,16 @@ def run_liteloc_one_movie(
     status.update({"return_code": return_code, "elapsed_seconds": elapsed_seconds})
 
     if return_code != 0:
-        status.update(
-            {
-                "status": "failed",
-                "message": "LiteLoc execution failed. Check liteloc.log.",
-            }
-        )
+        status.update({"status": "failed", "message": "LiteLoc execution failed. Check liteloc.log."})
         write_json(status, status_path)
         raise RuntimeError(f"LiteLoc inference failed. Check log: {log_path}")
 
     if not raw_output_path.exists():
-        status.update(
-            {
-                "status": "failed_no_csv",
-                "message": "LiteLoc finished, but expected raw CSV was not found.",
-            }
-        )
+        status.update({"status": "failed_no_csv", "message": "LiteLoc finished, but expected raw CSV was not found."})
         write_json(status, status_path)
-        raise FileNotFoundError(
-            f"LiteLoc finished but did not create expected CSV: {raw_output_path}"
-        )
+        raise FileNotFoundError(f"LiteLoc finished but did not create expected CSV: {raw_output_path}")
 
-    status.update(
-        {
-            "status": "real_liteloc_output_created",
-            "message": "Real LiteLoc inference completed successfully.",
-        }
-    )
+    status.update({"status": "real_liteloc_output_created", "message": "Real LiteLoc inference completed successfully."})
     write_json(status, status_path)
     return str(raw_output_path)
 
@@ -1131,216 +1060,57 @@ def run_liteloc_one_movie(
 
 # Calibration aliases
 
-
-def run_calibration(
-    input_path: str | Path,
-    out_dir: str | Path,
-    profile: Dict[str, Any],
-    backend_config: Optional[Dict[str, Any]] = None,
-    **kwargs: Any,
-) -> Dict[str, Any]:
-    return run_liteloc_calibration(
-        input_path=input_path,
-        out_dir=out_dir,
-        profile=profile,
-        backend_config=backend_config,
-        **kwargs,
-    )
+def run_calibration(input_path: str | Path, out_dir: str | Path, profile: Dict[str, Any], backend_config: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dict[str, Any]:
+    return run_liteloc_calibration(input_path=input_path, out_dir=out_dir, profile=profile, backend_config=backend_config, **kwargs)
 
 
-def calibrate_liteloc(
-    input_path: str | Path,
-    out_dir: str | Path,
-    profile: Dict[str, Any],
-    backend_config: Optional[Dict[str, Any]] = None,
-    **kwargs: Any,
-) -> Dict[str, Any]:
-    return run_liteloc_calibration(
-        input_path=input_path,
-        out_dir=out_dir,
-        profile=profile,
-        backend_config=backend_config,
-        **kwargs,
-    )
+def calibrate_liteloc(input_path: str | Path, out_dir: str | Path, profile: Dict[str, Any], backend_config: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dict[str, Any]:
+    return run_liteloc_calibration(input_path=input_path, out_dir=out_dir, profile=profile, backend_config=backend_config, **kwargs)
 
 
-def run_calibrate(
-    input_path: str | Path,
-    out_dir: str | Path,
-    profile: Dict[str, Any],
-    backend_config: Optional[Dict[str, Any]] = None,
-    **kwargs: Any,
-) -> Dict[str, Any]:
-    return run_liteloc_calibration(
-        input_path=input_path,
-        out_dir=out_dir,
-        profile=profile,
-        backend_config=backend_config,
-        **kwargs,
-    )
+def run_calibrate(input_path: str | Path, out_dir: str | Path, profile: Dict[str, Any], backend_config: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dict[str, Any]:
+    return run_liteloc_calibration(input_path=input_path, out_dir=out_dir, profile=profile, backend_config=backend_config, **kwargs)
 
 
-def calibrate(
-    input_path: str | Path,
-    out_dir: str | Path,
-    profile: Dict[str, Any],
-    backend_config: Optional[Dict[str, Any]] = None,
-    **kwargs: Any,
-) -> Dict[str, Any]:
-    return run_liteloc_calibration(
-        input_path=input_path,
-        out_dir=out_dir,
-        profile=profile,
-        backend_config=backend_config,
-        **kwargs,
-    )
+def calibrate(input_path: str | Path, out_dir: str | Path, profile: Dict[str, Any], backend_config: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dict[str, Any]:
+    return run_liteloc_calibration(input_path=input_path, out_dir=out_dir, profile=profile, backend_config=backend_config, **kwargs)
 
 
 # Training aliases
 
-
-def run_training(
-    input_path: str | Path,
-    out_dir: str | Path,
-    profile: Dict[str, Any],
-    backend_config: Optional[Dict[str, Any]] = None,
-    **kwargs: Any,
-) -> Dict[str, Any]:
-    return run_liteloc_training(
-        input_path=input_path,
-        out_dir=out_dir,
-        profile=profile,
-        backend_config=backend_config,
-        **kwargs,
-    )
+def run_training(input_path: str | Path, out_dir: str | Path, profile: Dict[str, Any], backend_config: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dict[str, Any]:
+    return run_liteloc_training(input_path=input_path, out_dir=out_dir, profile=profile, backend_config=backend_config, **kwargs)
 
 
-def train_liteloc(
-    input_path: str | Path,
-    out_dir: str | Path,
-    profile: Dict[str, Any],
-    backend_config: Optional[Dict[str, Any]] = None,
-    **kwargs: Any,
-) -> Dict[str, Any]:
-    return run_liteloc_training(
-        input_path=input_path,
-        out_dir=out_dir,
-        profile=profile,
-        backend_config=backend_config,
-        **kwargs,
-    )
+def train_liteloc(input_path: str | Path, out_dir: str | Path, profile: Dict[str, Any], backend_config: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dict[str, Any]:
+    return run_liteloc_training(input_path=input_path, out_dir=out_dir, profile=profile, backend_config=backend_config, **kwargs)
 
 
-def run_train(
-    input_path: str | Path,
-    out_dir: str | Path,
-    profile: Dict[str, Any],
-    backend_config: Optional[Dict[str, Any]] = None,
-    **kwargs: Any,
-) -> Dict[str, Any]:
-    return run_liteloc_training(
-        input_path=input_path,
-        out_dir=out_dir,
-        profile=profile,
-        backend_config=backend_config,
-        **kwargs,
-    )
+def run_train(input_path: str | Path, out_dir: str | Path, profile: Dict[str, Any], backend_config: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dict[str, Any]:
+    return run_liteloc_training(input_path=input_path, out_dir=out_dir, profile=profile, backend_config=backend_config, **kwargs)
 
 
-def train(
-    input_path: str | Path,
-    out_dir: str | Path,
-    profile: Dict[str, Any],
-    backend_config: Optional[Dict[str, Any]] = None,
-    **kwargs: Any,
-) -> Dict[str, Any]:
-    return run_liteloc_training(
-        input_path=input_path,
-        out_dir=out_dir,
-        profile=profile,
-        backend_config=backend_config,
-        **kwargs,
-    )
+def train(input_path: str | Path, out_dir: str | Path, profile: Dict[str, Any], backend_config: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dict[str, Any]:
+    return run_liteloc_training(input_path=input_path, out_dir=out_dir, profile=profile, backend_config=backend_config, **kwargs)
 
 
 # Inference aliases
 
-
-def run_liteloc_inference(
-    input_path: str | Path,
-    out_dir: str | Path,
-    profile: Dict[str, Any],
-    backend_config: Optional[Dict[str, Any]] = None,
-    **kwargs: Any,
-) -> Optional[str]:
-    return run_liteloc_one_movie(
-        input_path=input_path,
-        out_dir=out_dir,
-        profile=profile,
-        backend_config=backend_config,
-        **kwargs,
-    )
+def run_liteloc_inference(input_path: str | Path, out_dir: str | Path, profile: Dict[str, Any], backend_config: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Optional[str]:
+    return run_liteloc_one_movie(input_path=input_path, out_dir=out_dir, profile=profile, backend_config=backend_config, **kwargs)
 
 
-def run_inference_one_movie(
-    input_path: str | Path,
-    out_dir: str | Path,
-    profile: Dict[str, Any],
-    backend_config: Optional[Dict[str, Any]] = None,
-    **kwargs: Any,
-) -> Optional[str]:
-    return run_liteloc_one_movie(
-        input_path=input_path,
-        out_dir=out_dir,
-        profile=profile,
-        backend_config=backend_config,
-        **kwargs,
-    )
+def run_inference_one_movie(input_path: str | Path, out_dir: str | Path, profile: Dict[str, Any], backend_config: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Optional[str]:
+    return run_liteloc_one_movie(input_path=input_path, out_dir=out_dir, profile=profile, backend_config=backend_config, **kwargs)
 
 
-def run_inference(
-    input_path: str | Path,
-    out_dir: str | Path,
-    profile: Dict[str, Any],
-    backend_config: Optional[Dict[str, Any]] = None,
-    **kwargs: Any,
-) -> Optional[str]:
-    return run_liteloc_one_movie(
-        input_path=input_path,
-        out_dir=out_dir,
-        profile=profile,
-        backend_config=backend_config,
-        **kwargs,
-    )
+def run_inference(input_path: str | Path, out_dir: str | Path, profile: Dict[str, Any], backend_config: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Optional[str]:
+    return run_liteloc_one_movie(input_path=input_path, out_dir=out_dir, profile=profile, backend_config=backend_config, **kwargs)
 
 
-def run_liteloc(
-    input_path: str | Path,
-    out_dir: str | Path,
-    profile: Dict[str, Any],
-    backend_config: Optional[Dict[str, Any]] = None,
-    **kwargs: Any,
-) -> Optional[str]:
-    return run_liteloc_one_movie(
-        input_path=input_path,
-        out_dir=out_dir,
-        profile=profile,
-        backend_config=backend_config,
-        **kwargs,
-    )
+def run_liteloc(input_path: str | Path, out_dir: str | Path, profile: Dict[str, Any], backend_config: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Optional[str]:
+    return run_liteloc_one_movie(input_path=input_path, out_dir=out_dir, profile=profile, backend_config=backend_config, **kwargs)
 
 
-def infer(
-    input_path: str | Path,
-    out_dir: str | Path,
-    profile: Dict[str, Any],
-    backend_config: Optional[Dict[str, Any]] = None,
-    **kwargs: Any,
-) -> Optional[str]:
-    return run_liteloc_one_movie(
-        input_path=input_path,
-        out_dir=out_dir,
-        profile=profile,
-        backend_config=backend_config,
-        **kwargs,
-    )
+def infer(input_path: str | Path, out_dir: str | Path, profile: Dict[str, Any], backend_config: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Optional[str]:
+    return run_liteloc_one_movie(input_path=input_path, out_dir=out_dir, profile=profile, backend_config=backend_config, **kwargs)

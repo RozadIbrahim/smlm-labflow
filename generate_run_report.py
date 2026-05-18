@@ -346,9 +346,7 @@ def generate_markdown_report(
         "gpu_peak_memory_allocated_mb",
     ]
 
-    batch_md = dataframe_to_markdown(
-        select_existing_columns(batch_df, batch_cols)
-    )
+    batch_md = dataframe_to_markdown(select_existing_columns(batch_df, batch_cols))
 
     runtime_md = dataframe_to_markdown(
         select_existing_columns(runtime_df, runtime_cols)
@@ -442,9 +440,7 @@ def generate_html_report(
     if not runtime_df.empty and "elapsed_sec" in runtime_df.columns:
         runtime_total = str(
             round(
-                float(
-                    pd.to_numeric(runtime_df["elapsed_sec"], errors="coerce").sum()
-                ),
+                float(pd.to_numeric(runtime_df["elapsed_sec"], errors="coerce").sum()),
                 3,
             )
         )
@@ -486,13 +482,9 @@ def generate_html_report(
         "gpu_peak_memory_allocated_mb",
     ]
 
-    batch_table = make_html_table(
-        select_existing_columns(batch_df, batch_cols)
-    )
+    batch_table = make_html_table(select_existing_columns(batch_df, batch_cols))
 
-    runtime_table = make_html_table(
-        select_existing_columns(runtime_df, runtime_cols)
-    )
+    runtime_table = make_html_table(select_existing_columns(runtime_df, runtime_cols))
 
     preview_cards = collect_preview_cards(batch_df)
 

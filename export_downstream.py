@@ -33,7 +33,9 @@ from typing import Any, Dict, Optional
 import pandas as pd
 
 
-def get_nested(profile: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> Any:
+def get_nested(
+    profile: Optional[Dict[str, Any]], *keys: str, default: Any = None
+) -> Any:
     if profile is None:
         return default
 
@@ -106,7 +108,9 @@ def export_picasso_thunderstorm(
     )
 
     default_uncertainty_nm = float(
-        get_nested(profile, "downstream", "picasso", "default_uncertainty_xy_nm", default=20.0)
+        get_nested(
+            profile, "downstream", "picasso", "default_uncertainty_xy_nm", default=20.0
+        )
     )
 
     picasso = pd.DataFrame()

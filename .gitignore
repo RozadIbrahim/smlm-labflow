@@ -31,3 +31,29 @@ outputs/
 # OS
 .DS_Store
 Thumbs.db
+
+# Generated pipeline outputs
+results/
+benchmarks/
+reports/
+registry/
+
+# SMLM raw data / calibration / model artifacts
+*.tif
+*.tiff
+*.ome.tif
+*.ome.tiff
+*.mat
+*.h5
+*.hdf5
+*.pkl
+*.pt
+*.pth
+*.ckpt
+
+# Python/cache/env
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.env
+.venv/
