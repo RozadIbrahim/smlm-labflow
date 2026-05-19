@@ -406,9 +406,9 @@ Please also cite LiteLoc and any downstream tools used to generate or analyze re
 ## Maintainer
 
 ```text
-<Your Name>
-<Institution / Laboratory>
-<Contact or GitHub profile>
+Rozad Ibrahim
+ESBS at Strasbourg's University
+IbrahimLabs
 ```
 
 [1]: https://www.wired.com/2013/07/github-licenses?utm_source=chatgpt.com "GitHub Helps Clueless Coders Go Open Source"
