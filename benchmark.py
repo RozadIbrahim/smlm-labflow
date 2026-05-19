@@ -63,7 +63,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
 # =============================================================================
@@ -154,6 +154,48 @@ def write_rows_csv(rows: Sequence[Mapping[str, Any]], path: Path) -> None:
         writer.writeheader()
         for row in rows:
             writer.writerow(flatten_for_csv(row))
+
+
+def read_rows_csv(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+
+    try:
+        with path.open("r", newline="", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+    except Exception:
+        return []
+
+
+def write_or_replace_rows_csv(
+    rows: Sequence[Mapping[str, Any]],
+    path: Path,
+    replace_where: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """
+    Write rows without silently losing previous batches.
+
+    If replace_where is provided, existing rows matching all those key/value
+    pairs are removed first, then the new rows are appended. This gives stable
+    rerun behavior for a batch while preserving previous batches in the same
+    CSV.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing = read_rows_csv(path)
+    if replace_where:
+        criteria = {key: "" if value is None else str(value) for key, value in replace_where.items()}
+
+        def keep(row: Mapping[str, Any]) -> bool:
+            for key, expected in criteria.items():
+                if str(row.get(key, "")) != expected:
+                    return True
+            return False
+
+        existing = [row for row in existing if keep(row)]
+
+    merged: List[Mapping[str, Any]] = list(existing) + list(rows)
+    write_rows_csv(merged, path)
 
 
 def safe_import_psutil():
@@ -487,10 +529,18 @@ def maybe_plot_density(
     x: Sequence[float], y: Sequence[float], path: Path, title: str
 ) -> Optional[str]:
     plt = safe_import_matplotlib()
-    clean_x = [v for v in x if safe_float(v) is not None]
-    clean_y = [v for v in y if safe_float(v) is not None]
-    if plt is None or not clean_x or not clean_y:
+    pairs: List[Tuple[float, float]] = []
+    for xv, yv in zip(x, y):
+        xf = safe_float(xv)
+        yf = safe_float(yv)
+        if xf is not None and yf is not None:
+            pairs.append((xf, yf))
+
+    if plt is None or not pairs:
         return None
+
+    clean_x = [pair[0] for pair in pairs]
+    clean_y = [pair[1] for pair in pairs]
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -662,11 +712,16 @@ class ResourceSampler:
     """
 
     def __init__(
-        self, out_dir: Path, sample_interval_sec: float = 1.0, enabled: bool = True
+        self,
+        out_dir: Path,
+        sample_interval_sec: float = 1.0,
+        enabled: bool = True,
+        write_every_n_samples: int = 10,
     ) -> None:
         self.out_dir = out_dir
         self.sample_interval_sec = max(0.2, float(sample_interval_sec))
         self.enabled = enabled
+        self.write_every_n_samples = max(1, int(write_every_n_samples))
         self.csv_path = self.out_dir / "resource_benchmark.csv"
         self.json_path = self.out_dir / "resource_benchmark.json"
         self.psutil = safe_import_psutil()
@@ -682,6 +737,7 @@ class ResourceSampler:
                 self.process = None
 
         self.rows: List[Dict[str, Any]] = []
+        self._samples_since_write = 0
         self._stop_event: Optional[threading.Event] = None
         self._thread: Optional[threading.Thread] = None
         self._active_stage: Dict[str, Any] = {}
@@ -761,7 +817,10 @@ class ResourceSampler:
         while not self._stop_event.is_set():
             try:
                 self.rows.append(self.snapshot())
-                self.write()
+                self._samples_since_write += 1
+                if self._samples_since_write >= self.write_every_n_samples:
+                    self.write()
+                    self._samples_since_write = 0
             except Exception:
                 pass
             self._stop_event.wait(self.sample_interval_sec)
@@ -793,6 +852,7 @@ class ResourceSampler:
         try:
             self.rows.append(self.snapshot())
             self.write()
+            self._samples_since_write = 0
         except Exception:
             pass
 
@@ -852,6 +912,7 @@ def benchmark_input_movie(
     out_dir: Path,
     batch_index: Optional[int] = None,
     max_sample_frames: int = 200,
+    max_pixels_per_frame: int = 50_000,
 ) -> Dict[str, Any]:
     """Input QC benchmark for TIFF/OME-TIFF movies."""
     tifffile = safe_import_tifffile()
@@ -893,7 +954,7 @@ def benchmark_input_movie(
     if tifffile is None or np is None:
         row["status"] = "not_available"
         row["message"] = "tifffile and/or numpy not installed."
-        write_rows_csv([row], out_dir / "input_qc_benchmark.csv")
+        write_or_replace_rows_csv([row], out_dir / "input_qc_benchmark.csv", {"benchmark_layer": "input_qc", "batch_index": batch_index, "input_path": str(input_path)})
         return row
 
     try:
@@ -922,10 +983,17 @@ def benchmark_input_movie(
 
             samples = []
             frame_means = []
+            rng = np.random.default_rng(42)
             for idx in frame_indices:
                 frame = np.asarray(arr[idx], dtype=float)
-                samples.append(frame.ravel())
                 frame_means.append(float(np.mean(frame)))
+                flat = frame.ravel()
+                if flat.size > max_pixels_per_frame:
+                    sample_idx = rng.choice(
+                        flat.size, size=max_pixels_per_frame, replace=False
+                    )
+                    flat = flat[sample_idx]
+                samples.append(flat)
 
             sample_values = (
                 np.concatenate(samples) if samples else np.asarray([], dtype=float)
@@ -993,7 +1061,7 @@ def benchmark_input_movie(
         row["status"] = "failed"
         row["message"] = repr(exc)
 
-    write_rows_csv([row], out_dir / "input_qc_benchmark.csv")
+    write_or_replace_rows_csv([row], out_dir / "input_qc_benchmark.csv", {"benchmark_layer": "input_qc", "batch_index": batch_index, "input_path": str(input_path)})
     return row
 
 
@@ -1046,7 +1114,7 @@ def benchmark_localizations(
     if not canonical_csv.exists():
         row["status"] = "failed"
         row["message"] = "Canonical CSV does not exist."
-        write_rows_csv([row], out_dir / "localization_qc_benchmark.csv")
+        write_or_replace_rows_csv([row], out_dir / "localization_qc_benchmark.csv", {"benchmark_layer": "localization_qc", "batch_index": batch_index, "canonical_csv": str(canonical_csv)})
         return row
 
     try:
@@ -1065,7 +1133,7 @@ def benchmark_localizations(
         if missing:
             row["status"] = "failed"
             row["message"] = f"Missing required canonical columns: {missing}"
-            write_rows_csv([row], out_dir / "localization_qc_benchmark.csv")
+            write_or_replace_rows_csv([row], out_dir / "localization_qc_benchmark.csv", {"benchmark_layer": "localization_qc", "batch_index": batch_index, "canonical_csv": str(canonical_csv)})
             return row
 
         x_vals = table_numeric_values(table, roles["x"])
@@ -1190,7 +1258,7 @@ def benchmark_localizations(
         row["status"] = "failed"
         row["message"] = repr(exc)
 
-    write_rows_csv([row], out_dir / "localization_qc_benchmark.csv")
+    write_or_replace_rows_csv([row], out_dir / "localization_qc_benchmark.csv", {"benchmark_layer": "localization_qc", "batch_index": batch_index, "canonical_csv": str(canonical_csv)})
     return row
 
 
@@ -1269,7 +1337,7 @@ def benchmark_resolution_proxy(
         }
     )
 
-    write_rows_csv(rows, out_dir / "resolution_benchmark.csv")
+    write_or_replace_rows_csv(rows, out_dir / "resolution_benchmark.csv", {"benchmark_layer": "resolution", "batch_index": batch_index})
     return {
         "status": "passed",
         "resolution_csv": str(out_dir / "resolution_benchmark.csv"),
@@ -1307,7 +1375,7 @@ def benchmark_drift_proxy(
     if not canonical_csv.exists():
         base["status"] = "failed"
         base["message"] = "Canonical CSV not found."
-        write_rows_csv([base], output_csv)
+        write_or_replace_rows_csv([base], output_csv, {"benchmark_layer": "drift", "batch_index": batch_index, "canonical_csv": str(canonical_csv)})
         return base
 
     try:
@@ -1315,7 +1383,7 @@ def benchmark_drift_proxy(
         if pd is None:
             base["status"] = "not_available"
             base["message"] = "pandas not installed; drift proxy skipped."
-            write_rows_csv([base], output_csv)
+            write_or_replace_rows_csv([base], output_csv, {"benchmark_layer": "drift", "batch_index": batch_index, "canonical_csv": str(canonical_csv)})
             return base
 
         table = read_table(canonical_csv)
@@ -1327,7 +1395,7 @@ def benchmark_drift_proxy(
         ):
             base["status"] = "not_available"
             base["message"] = "frame/x/y columns not available."
-            write_rows_csv([base], output_csv)
+            write_or_replace_rows_csv([base], output_csv, {"benchmark_layer": "drift", "batch_index": batch_index, "canonical_csv": str(canonical_csv)})
             return base
 
         frame_col = roles["frame"]
@@ -1342,7 +1410,7 @@ def benchmark_drift_proxy(
         if len(df) < 10:
             base["status"] = "not_available"
             base["message"] = "Too few localizations for drift proxy."
-            write_rows_csv([base], output_csv)
+            write_or_replace_rows_csv([base], output_csv, {"benchmark_layer": "drift", "batch_index": batch_index, "canonical_csv": str(canonical_csv)})
             return base
 
         min_frame = int(df[frame_col].min())
@@ -1350,7 +1418,7 @@ def benchmark_drift_proxy(
         if max_frame <= min_frame:
             base["status"] = "not_available"
             base["message"] = "Only one frame detected."
-            write_rows_csv([base], output_csv)
+            write_or_replace_rows_csv([base], output_csv, {"benchmark_layer": "drift", "batch_index": batch_index, "canonical_csv": str(canonical_csv)})
             return base
 
         bins = max(2, min(n_bins, max_frame - min_frame + 1))
@@ -1371,7 +1439,7 @@ def benchmark_drift_proxy(
         if len(grouped) < 2:
             base["status"] = "not_available"
             base["message"] = "Not enough populated frame bins."
-            write_rows_csv([base], output_csv)
+            write_or_replace_rows_csv([base], output_csv, {"benchmark_layer": "drift", "batch_index": batch_index, "canonical_csv": str(canonical_csv)})
             return base
 
         x0 = float(grouped["median_x"].iloc[0])
@@ -1404,13 +1472,13 @@ def benchmark_drift_proxy(
             or ""
         )
 
-        write_rows_csv([base] + rows, output_csv)
+        write_or_replace_rows_csv([base] + rows, output_csv, {"benchmark_layer": "drift", "batch_index": batch_index, "canonical_csv": str(canonical_csv)})
         return base
 
     except Exception as exc:
         base["status"] = "failed"
         base["message"] = repr(exc)
-        write_rows_csv([base], output_csv)
+        write_or_replace_rows_csv([base], output_csv, {"benchmark_layer": "drift", "batch_index": batch_index, "canonical_csv": str(canonical_csv)})
         return base
 
 
@@ -1481,7 +1549,7 @@ def validate_exports(
 
         rows.append(row)
 
-    write_rows_csv(rows, output_csv)
+    write_or_replace_rows_csv(rows, output_csv, {"benchmark_layer": "export_validation"})
     return {
         "status": "passed"
         if all(r["status"] in {"passed", "skipped"} for r in rows)
@@ -1531,7 +1599,7 @@ def benchmark_truth_matching(
     if not prediction_csv.exists() or not truth_csv.exists():
         row["status"] = "not_available"
         row["message"] = "Prediction or truth CSV missing."
-        write_rows_csv([row], output_csv)
+        write_or_replace_rows_csv([row], output_csv, {"benchmark_layer": "truth", "batch_index": batch_index, "prediction_csv": str(prediction_csv), "truth_csv": str(truth_csv)})
         write_rows_csv([], pairs_csv)
         return row
 
@@ -1772,14 +1840,14 @@ def benchmark_truth_matching(
 
         row["status"] = "passed"
         row["message"] = "Truth benchmark completed."
-        write_rows_csv([row], output_csv)
+        write_or_replace_rows_csv([row], output_csv, {"benchmark_layer": "truth", "batch_index": batch_index, "prediction_csv": str(prediction_csv), "truth_csv": str(truth_csv)})
         write_rows_csv(pairs, pairs_csv)
         return row
 
     except Exception as exc:
         row["status"] = "failed"
         row["message"] = repr(exc)
-        write_rows_csv([row], output_csv)
+        write_or_replace_rows_csv([row], output_csv, {"benchmark_layer": "truth", "batch_index": batch_index, "prediction_csv": str(prediction_csv), "truth_csv": str(truth_csv)})
         write_rows_csv([], pairs_csv)
         return row
 
@@ -1951,12 +2019,14 @@ class RuntimeBenchmark:
         input_path: str | Path,
         batch_index: Optional[int] = None,
         max_sample_frames: int = 200,
+        max_pixels_per_frame: int = 50_000,
     ) -> Dict[str, Any]:
         result = benchmark_input_movie(
             Path(input_path).expanduser().resolve(),
             self.out_dir,
             batch_index=batch_index,
             max_sample_frames=max_sample_frames,
+            max_pixels_per_frame=max_pixels_per_frame,
         )
         self.layer_outputs.setdefault("input_qc", []).append(result)
         self.write_summary()

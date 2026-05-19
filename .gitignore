@@ -58,3 +58,7 @@ __pycache__/
 .env
 .venv/
 .env.vast
+
+# Local diagnostics / backups
+diagnostics/
+*.bak_*

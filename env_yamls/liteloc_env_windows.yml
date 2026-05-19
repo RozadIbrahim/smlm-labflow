@@ -1,0 +1,40 @@
+name: liteloc_env
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.9
+  - pip
+
+  # Scientific stack
+  - numpy=1.24
+  - pandas
+  - scipy
+  - matplotlib
+  - scikit-image
+  - tifffile
+  - h5py
+  - imageio
+  - pillow
+  - tqdm
+  - natsort
+  - omegaconf
+  - pyyaml
+  - git
+
+  # Pip stack
+  - pip:
+      # PyTorch CUDA 12.1 wheels
+      - --extra-index-url https://download.pytorch.org/whl/cu121
+      - torch==2.2.2+cu121
+      - torchvision==0.17.2+cu121
+      - torchaudio==2.2.2+cu121
+
+      # LiteLoc/helper dependencies
+      - deprecated
+      - dotted-dict
+      - hdfdict
+      - recursivenamespace
+      - thop

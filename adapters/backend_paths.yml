@@ -1,4 +1,7 @@
 # adapters/backend_paths.yml
+# Machine-specific backend wiring only.
+# Edit this once per lab machine.
+
 liteloc:
   root: /common_data/conda_envs/LiteLoc
 
@@ -20,20 +23,8 @@ liteloc:
     train: module
     infer: module
 
-  quality_control:
-    run_after_calibrate: true
-    run_after_train: true
-    run_after_infer: true
-
-    calibration_metrics:
-      enabled: true
-      psf_fit_diagnostics: true
-
-    training_metrics:
-      enabled: true
-      crlb_rmse: true
-
-    localization_metrics:
-      enabled: true
-      grid_artifact_index: true
-      fft_grid_spectrum: true
+  supported_calibration_modes:
+    - vector_beads
+    - spline_file
+    - none
+    - analytic
