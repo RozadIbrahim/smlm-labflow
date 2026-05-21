@@ -1,18 +1,42 @@
---extra-index-url https://download.pytorch.org/whl/cu121
+# requirements/remote.txt
+# Vast.ai / Docker Python dependencies.
+#
+# This file is pip-only.
+# Do not put Conda-only syntax here:
+#   - python=3.9
+#   - pip
+#   - git
+# Those are handled by docker/Dockerfile.vast.
 
-torch==2.2.2+cu121
-torchvision==0.17.2+cu121
-torchaudio==2.2.2+cu121
+--index-url https://download.pytorch.org/whl/cu121
+--extra-index-url https://pypi.org/simple
 
+# PyTorch CUDA 12.1 stack
+torch==2.2.2
+torchvision==0.17.2
+torchaudio==2.2.2
+
+# Scientific stack
 numpy==1.24.4
 pandas
 scipy
+matplotlib
 scikit-image
 tifffile
-matplotlib
 h5py
-PyYAML==5.4.1
-omegaconf==2.3.0
-natsort
+imageio
+pillow
 tqdm
+natsort
+omegaconf
+PyYAML
+
+# Runtime / reporting helpers
 psutil
+
+# LiteLoc/helper dependencies
+Deprecated
+dotted-dict
+hdfdict
+recursivenamespace
+thop
