@@ -62,3 +62,50 @@ __pycache__/
 # Local diagnostics / backups
 diagnostics/
 *.bak_*
+# Outputs
+results/
+benchmarks/
+reports/
+registry/
+outputs/
+
+# Data
+data/
+datasets/
+raw_data/
+*.tif
+*.tiff
+*.ome.tif
+*.ome.tiff
+*.h5
+*.hdf5
+
+# Models / checkpoints
+*.pt
+*.pth
+*.ckpt
+
+# Local/private config
+.env
+
+# Secrets / SSH
+*.key
+*.pem
+id_rsa
+id_rsa.pub
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.bak*
+*.log
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+adapters/backend_paths.local.yml

@@ -1,0 +1,30 @@
+# adapters/backend_paths.yml
+# Machine-specific backend wiring only.
+# Edit this once per lab machine.
+
+liteloc:
+  root: /common_data/conda_envs/LiteLoc
+
+  modules:
+    vector_calibration: utils/vectorpsf_fit.py
+    spline_calibration_io: spline_psf/calibration_io.py
+    train: network/loc_model.py
+    infer: network/multi_process.py
+
+  functions:
+    vector_calibration: beads_psf_calibrate
+    spline_loader_class: SMAPSplineCoefficient
+    train_class: LocModel
+    infer_class: CompetitiveSmlmDataAnalyzer_multi_producer
+
+  execution:
+    vector_calibration: function
+    spline_calibration_io: module
+    train: module
+    infer: module
+
+  supported_calibration_modes:
+    - vector_beads
+    - spline_file
+    - none
+    - analytic
