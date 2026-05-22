@@ -6,7 +6,8 @@
 #
 # hdfdict is intentionally NOT here because hdfdict==0.3.1 declares
 # pyyaml<6.0, which conflicts with PyYAML==6.0.2.
-# It is installed separately in docker/Dockerfile.vast with --no-deps.
+# It is installed separately in docker/Dockerfile.vast with --no-deps,
+# then patched to avoid enforcing that stale metadata at import time.
 
 # Scientific stack
 numpy==1.24.4
