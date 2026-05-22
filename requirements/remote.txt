@@ -1,16 +1,7 @@
-cat > requirements/remote.txt <<'TXT'
 # requirements/remote.txt
 # Vast.ai / Docker Python dependencies.
-#
-# Pip-only file.
-# Do not put Conda-only syntax here:
-#   - python=3.9
-#   - pip
-#   - git
-# Those are handled by docker/Dockerfile.vast.
+# Pip-only file. Conda/system packages belong in docker/Dockerfile.vast.
 
-# PyTorch CUDA 12.1 wheels.
-# PyTorch official previous-version install syntax uses the cu121 wheel index.
 --extra-index-url https://download.pytorch.org/whl/cu121
 
 # PyTorch CUDA 12.1 stack
@@ -32,8 +23,6 @@ tqdm
 natsort
 omegaconf
 PyYAML
-
-# Runtime / reporting helpers
 psutil
 
 # LiteLoc/helper dependencies
@@ -42,4 +31,3 @@ dotted-dict
 hdfdict
 RecursiveNamespace
 thop
-TXT
