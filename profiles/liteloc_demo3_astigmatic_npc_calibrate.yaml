@@ -1,0 +1,236 @@
+# Unified, path-free LiteLoc profile for SMLM LabFlow.
+#
+# Demo3-style LiteLoc PSF calibration profile.
+# Target: astigmatic 3D Nup96/NPC PSF calibration from beads.
+#
+# Do not put LiteLoc installation paths here.
+# Machine-specific backend paths belong in adapters/backend_paths.yml.
+# Fields set to "auto" are filled by LabFlow at runtime.
+
+profile_name: liteloc_demo3_astigmatic_npc_calibrate
+
+backend:
+  name: liteloc
+
+experiment:
+  modality: smlm
+  psf_type: astigmatic
+  dimensionality: 3d
+  sample: nup96_npc
+
+microscope:
+  pixel_size_nm: 110
+  emission_wavelength_nm: 680
+  numerical_aperture: 1.5
+
+calibration:
+  enabled: true
+  mode: vector_beads
+  use_input_symlink: true
+  z_step_nm: 35
+
+training:
+  device: cuda
+
+inference:
+  device: cuda
+  coord_units: nm
+  batch_size: 64
+  threshold: 0.25
+  time_block_gb: 1
+  sub_fov_size: 256
+  over_cut: 8
+  data_queue_size: 100
+  multi_gpu: false
+  num_producers: 1
+  end_frame_num: null
+
+output:
+  raw_output_name: liteloc_raw_output.csv
+  canonical_output_name: canonical_localizations.csv
+  runtime_yaml_name: runtime_liteloc_infer.yaml
+  log_name: liteloc.log
+
+canonical:
+  coordinate_unit: nm
+  frame_indexing: one_based_observed
+  confidence_source_column: prob
+  background_available: false
+
+downstream:
+  export_picasso: true
+  export_smap: false
+  export_napari: true
+  export_locan: true
+  napari_units: nm
+  locan_units: nm
+  default_locprec_nm: 20
+  default_lpx_px: 1
+
+liteloc:
+  runtime_yaml:
+    calibration:
+      psf_params_dict:
+        na: 1.5
+        wavelength: 680
+        refmed: 1.518
+        refcov: 1.524
+        refimm: 1.518
+        zernike_aber:
+          - 2
+          - -2
+          - 0
+          - 2
+          - 2
+          - 0
+          - 3
+          - -1
+          - 0
+          - 3
+          - 1
+          - 0
+          - 4
+          - 0
+          - 0
+          - 3
+          - -3
+          - 0
+          - 3
+          - 3
+          - 0
+          - 4
+          - -2
+          - 0
+          - 4
+          - 2
+          - 0
+          - 5
+          - -1
+          - 0
+          - 5
+          - 1
+          - 0
+          - 6
+          - 0
+          - 0
+          - 4
+          - -4
+          - 0
+          - 4
+          - 4
+          - 0
+          - 5
+          - -3
+          - 0
+          - 5
+          - 3
+          - 0
+          - 6
+          - -2
+          - 0
+          - 6
+          - 2
+          - 0
+          - 7
+          - 1
+          - 0
+          - 7
+          - -1
+          - 0
+          - 8
+          - 0
+          - 0
+        objstage0: 0
+        pixel_size_xy:
+          - 110
+          - 110
+        otf_rescale_xy:
+          - 0.5
+          - 0.5
+        npupil: 64
+        psf_size: 27
+      camera_params_dict:
+        camera_type: SCMOS
+        qe: 0.95
+        spurious_charge: 0.002
+        read_noise_sigma: 1.535
+        e_per_adu: 0.7471
+        baseline: 100.0
+      calib_params_dict:
+        z_step: 35
+        filter_sigma: 3
+        threshold_abs: 20
+        fit_brightest: true
+      beads_file_name: auto
+
+    train:
+      Camera:
+        camera: sCMOS
+        em_gain: 1.0
+        surv_p: 0.5
+        qe: 0.95
+        spurious_c: 0.002
+        sig_read: 1.535
+        e_per_adu: 0.7471
+        baseline: 100.0
+      PSF_model:
+        z_scale: 700
+        simulate_method: vector
+        spline_psf:
+          calibration_file: auto
+          psf_extent:
+            - [-0.5, 63.5]
+            - [-0.5, 63.5]
+            - null
+          device_simulation: cuda
+        vector_psf:
+          objstage0: 0
+          zernikefit_file: auto
+          pixelSizeX: 110
+          pixelSizeY: 110
+          psfSizeX: 27
+          NA: 1.5
+          refmed: 1.518
+          refcov: 1.524
+          refimm: 1.518
+          wavelength: 680
+          zernikefit_map: null
+          psfrescale: 0.5
+          Npupil: 64
+          robust_training: false
+      Training:
+        max_epoch: 50
+        eval_iteration: 500
+        batch_size: 16
+        valid_frame_num: 100
+        em_per_frame: 10
+        train_size:
+          - 64
+          - 64
+        photon_range:
+          - 4000
+          - 40000
+        result_path: auto
+        infer_data: auto
+        bg: 211
+        perlin_noise: true
+        pn_factor: 0.2
+        pn_res: 64
+        factor: null
+        offset: null
+        model_init: null
+
+    infer:
+      Loc_Model:
+        model_path: auto
+      Multi_Process:
+        image_path: auto
+        save_path: auto
+        time_block_gb: 1
+        batch_size: 64
+        sub_fov_size: 256
+        over_cut: 8
+        data_queue_size: 100
+        multi_gpu: true
+        num_producers: 1
+        end_frame_num: null
