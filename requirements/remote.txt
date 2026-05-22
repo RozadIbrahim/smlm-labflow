@@ -1,12 +1,12 @@
 # requirements/remote.txt
-# Vast.ai / Docker Python dependencies.
+# Remote GPU / Docker Python dependencies.
 #
 # PyTorch is provided by:
 #   pytorch/pytorch:2.2.2-cuda12.1-cudnn8-runtime
 #
 # hdfdict is intentionally NOT here because hdfdict==0.3.1 declares
 # pyyaml<6.0, which conflicts with PyYAML==6.0.2.
-# It is installed separately in docker/Dockerfile.vast with --no-deps,
+# It is installed separately in docker/Dockerfile with --no-deps,
 # then patched to avoid enforcing that stale metadata at import time.
 
 # Scientific stack

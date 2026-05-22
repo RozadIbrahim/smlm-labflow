@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE_NAME="${IMAGE_NAME:-smlm-labflow-vast}"
+IMAGE_NAME="${IMAGE_NAME:-smlm-labflow}"
 
 INPUT_PATH="${1:-}"
 OUT_DIR="${2:-}"
@@ -9,7 +9,7 @@ PROFILE_PATH="${3:-profiles/standard_2d.yaml}"
 
 if [[ -z "${INPUT_PATH}" || -z "${OUT_DIR}" ]]; then
   echo "Usage:"
-  echo "  ./scripts/docker_run_vast.sh /absolute/path/to/movie.tif /absolute/path/to/output_dir profiles/standard_2d.yaml"
+  echo "  ./scripts/docker_run.sh /absolute/path/to/movie.tif /absolute/path/to/output_dir profiles/standard_2d.yaml"
   exit 1
 fi
 

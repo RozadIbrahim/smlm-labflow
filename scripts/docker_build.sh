@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE_NAME="${1:-smlm-labflow-vast}"
-DOCKERFILE="docker/Dockerfile.vast"
+IMAGE_NAME="${1:-smlm-labflow}"
+DOCKERFILE="docker/Dockerfile"
 
 echo "[INFO] Building Docker image: ${IMAGE_NAME}"
 docker build \

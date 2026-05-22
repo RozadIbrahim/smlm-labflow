@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE_NAME="${1:-smlm-labflow-vast}"
+IMAGE_NAME="${1:-smlm-labflow}"
 
 docker run --rm --gpus all "${IMAGE_NAME}" python3 - <<'PY'
 import torch
