@@ -1,10 +1,8 @@
+extends: liteloc_unified_example.yaml
+
 profile_name: astigmatic_3d_calibration
 
-backend:
-  name: liteloc
-
 experiment:
-  modality: smlm
   psf_type: astigmatic
   dimensionality: 3d
 
@@ -13,8 +11,5 @@ microscope:
 
 calibration:
   enabled: true
-  bead_dataset: true
+  mode: vector_beads
   z_step_nm: 50
-
-runtime:
-  device: auto

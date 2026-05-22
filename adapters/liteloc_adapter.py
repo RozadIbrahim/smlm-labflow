@@ -61,6 +61,7 @@ But the final design should use modules/functions/execution, not demo script por
 from __future__ import annotations
 
 import contextlib
+import copy
 import importlib
 import json
 import os
@@ -114,6 +115,86 @@ def deep_update(base: Dict[str, Any], patch: Mapping[str, Any]) -> Dict[str, Any
         else:
             base[key] = value
     return base
+
+
+def is_auto_value(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().lower() in {
+        "auto",
+        "labflow:auto",
+        "__auto__",
+    }
+
+
+def copied_mapping(value: Any, label: str) -> Dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{label} must be a mapping/dictionary.")
+    return copy.deepcopy(dict(value))
+
+
+def profile_liteloc_runtime_yaml(profile: Mapping[str, Any], stage: str) -> Dict[str, Any]:
+    """
+    Return an inline LiteLoc runtime YAML template from the LabFlow profile.
+
+    Supported profile forms:
+        liteloc.runtime_yaml.train
+        liteloc.train_config
+        training.runtime_yaml
+
+    The same pattern is supported for calibration and infer.
+    """
+    candidates = [
+        get_nested(profile, "liteloc", "runtime_yaml", stage),
+        get_nested(profile, "liteloc", f"{stage}_config"),
+    ]
+
+    if stage == "calibration":
+        candidates.append(get_nested(profile, "calibration", "runtime_yaml"))
+    elif stage == "train":
+        candidates.append(get_nested(profile, "training", "runtime_yaml"))
+    elif stage == "infer":
+        candidates.append(get_nested(profile, "inference", "runtime_yaml"))
+
+    for candidate in candidates:
+        if candidate:
+            return copied_mapping(candidate, f"LiteLoc {stage} runtime YAML")
+    return {}
+
+
+def load_liteloc_runtime_yaml(
+    *,
+    stage: str,
+    profile: Mapping[str, Any],
+    base_yaml_value: Any,
+    base_dir: Path,
+    required_sections: Sequence[str],
+) -> Tuple[Dict[str, Any], str]:
+    """
+    Load a LiteLoc YAML from either a base file or inline profile config.
+
+    Base YAMLs remain supported for compatibility, but deployable LabFlow
+    profiles can now contain the full LiteLoc YAML sections directly.
+    """
+    if base_yaml_value and not is_auto_value(base_yaml_value):
+        base_yaml_path = resolve_path(base_yaml_value, base_dir=base_dir)
+        return read_yaml(base_yaml_path), str(base_yaml_path)
+
+    config = profile_liteloc_runtime_yaml(profile, stage)
+    if not config:
+        sections = ", ".join(required_sections)
+        raise KeyError(
+            f"Missing LiteLoc {stage} runtime YAML. Add liteloc.runtime_yaml.{stage} "
+            f"with sections [{sections}], or provide a base_{stage}_yaml."
+        )
+
+    missing = [section for section in required_sections if section not in config]
+    if missing:
+        raise KeyError(
+            f"LiteLoc {stage} runtime YAML is missing required section(s): {missing}"
+        )
+
+    return config, f"profile:liteloc.runtime_yaml.{stage}"
 
 
 def write_json(data: Mapping[str, Any], path: Path) -> None:
@@ -599,13 +680,18 @@ def build_runtime_calibration_yaml(
         or get_nested(profile, "liteloc", "base_calibration_yaml")
     )
 
-    if not base_yaml_value:
-        raise KeyError(
-            "Missing calibration base YAML. Set calibration.base_yaml in the profile."
-        )
-
-    base_yaml_path = resolve_path(base_yaml_value, base_dir=repo_dir)
-    config = read_yaml(base_yaml_path)
+    config, config_source = load_liteloc_runtime_yaml(
+        stage="calibration",
+        profile=profile,
+        base_yaml_value=base_yaml_value,
+        base_dir=repo_dir,
+        required_sections=(
+            "psf_params_dict",
+            "camera_params_dict",
+            "calib_params_dict",
+            "beads_file_name",
+        ),
+    )
 
     beads_input = calibration_input_for_vector_beads(input_path, out_dir, profile)
 
@@ -621,7 +707,7 @@ def build_runtime_calibration_yaml(
             "source_input_path": str(input_path),
             "runtime_beads_file_name": str(beads_input),
             "out_dir": str(out_dir),
-            "base_yaml_path": str(base_yaml_path),
+            "config_source": config_source,
             "calibration_mode": "vector_beads",
         }
     )
@@ -641,12 +727,16 @@ def build_runtime_calibration_yaml(
 
     if z_step_nm is not None:
         config.setdefault("calib_params_dict", {})
+        config["calib_params_dict"].setdefault("z_step", z_step_nm)
         config["calib_params_dict"].setdefault("z_step_nm", z_step_nm)
         config["labflow"]["z_step_nm"] = z_step_nm
 
     if pixel_size_nm is not None:
         config.setdefault("psf_params_dict", {})
-        config["psf_params_dict"].setdefault("pixel_size_xy", pixel_size_nm)
+        config["psf_params_dict"].setdefault(
+            "pixel_size_xy",
+            [pixel_size_nm, pixel_size_nm],
+        )
         config["labflow"]["pixel_size_nm"] = pixel_size_nm
 
     patches = (
@@ -936,18 +1026,19 @@ def build_runtime_train_yaml(
         or get_nested(profile, "training", "base_yaml")
     )
 
-    if not base_yaml_value:
-        raise KeyError(
-            "Missing LiteLoc base training YAML. Set liteloc.base_train_yaml "
-            "or training.base_yaml in the profile."
-        )
-
-    base_yaml_path = resolve_path(base_yaml_value, base_dir=repo_dir)
-    config = read_yaml(base_yaml_path)
+    config, config_source = load_liteloc_runtime_yaml(
+        stage="train",
+        profile=profile,
+        base_yaml_value=base_yaml_value,
+        base_dir=repo_dir,
+        required_sections=("Camera", "PSF_model", "Training"),
+    )
 
     # LiteLoc LocModel.save_model() commonly writes to params.Training.result_path.
     config.setdefault("Training", {})
     config["Training"]["result_path"] = ensure_trailing_slash(out_dir)
+    if is_auto_value(config["Training"].get("infer_data")):
+        config["Training"]["infer_data"] = str(input_path)
 
     # Store wrapper provenance.
     config.setdefault("LabFlow", {})
@@ -956,7 +1047,7 @@ def build_runtime_train_yaml(
             "created_at": now_iso(),
             "source_input_path": str(input_path),
             "out_dir": str(out_dir),
-            "base_yaml_path": str(base_yaml_path),
+            "config_source": config_source,
             "calibration_mode": (
                 backend_config.get("calibration_mode")
                 or get_nested(profile, "calibration", "mode")
@@ -972,18 +1063,62 @@ def build_runtime_train_yaml(
         or ""
     )
 
-    if calibration_file:
+    if calibration_file and not is_auto_value(calibration_file):
         calibration_path = resolve_path(calibration_file, base_dir=repo_dir)
         config["LabFlow"]["calibration_file"] = str(calibration_path)
 
         # Common safe patch locations. Profile-specific train_yaml_patches can override.
         config.setdefault("PSF_model", {})
-        config["PSF_model"].setdefault("calibration_file", str(calibration_path))
+        simulate_method = normalize_mode(
+            get_nested(config, "PSF_model", "simulate_method"),
+            default="",
+        )
+        calibration_mode = normalize_mode(
+            backend_config.get("calibration_mode")
+            or get_nested(profile, "calibration", "mode"),
+            default="",
+        )
 
-        if normalize_mode(backend_config.get("calibration_mode") or get_nested(profile, "calibration", "mode")) == "spline_file":
-            config["PSF_model"].setdefault("simulate_method", "spline")
-        elif normalize_mode(backend_config.get("calibration_mode") or get_nested(profile, "calibration", "mode")) == "vector_beads":
-            config["PSF_model"].setdefault("simulate_method", "vector")
+        if not simulate_method:
+            simulate_method = "spline" if calibration_mode == "spline_file" else "vector"
+            config["PSF_model"]["simulate_method"] = simulate_method
+
+        if simulate_method == "spline":
+            config["PSF_model"].setdefault("spline_psf", {})
+            config["PSF_model"]["spline_psf"]["calibration_file"] = str(calibration_path)
+        elif simulate_method in {"vector", "uipsf"}:
+            vector_key = "ui_psf" if simulate_method == "uipsf" else "vector_psf"
+            config["PSF_model"].setdefault(vector_key, {})
+            config["PSF_model"][vector_key]["zernikefit_file"] = str(calibration_path)
+        else:
+            config["PSF_model"]["calibration_file"] = str(calibration_path)
+
+        for keys in (
+            ("PSF_model", "spline_psf", "calibration_file"),
+            ("PSF_model", "vector_psf", "zernikefit_file"),
+            ("PSF_model", "ui_psf", "zernikefit_file"),
+            ("PSF_model", "calibration_file"),
+        ):
+            if is_auto_value(get_nested(config, *keys)):
+                set_nested(config, keys, str(calibration_path))
+    else:
+        auto_calibration_fields = [
+            ("PSF_model", "spline_psf", "calibration_file"),
+            ("PSF_model", "vector_psf", "zernikefit_file"),
+            ("PSF_model", "ui_psf", "zernikefit_file"),
+            ("PSF_model", "calibration_file"),
+        ]
+        unresolved = [
+            ".".join(keys)
+            for keys in auto_calibration_fields
+            if is_auto_value(get_nested(config, *keys))
+        ]
+        if unresolved:
+            raise KeyError(
+                "LiteLoc training profile still contains auto calibration path(s): "
+                f"{unresolved}. Run `calibrate` first, or set calibration.file / "
+                "psf.calibration_file to a real calibration artifact."
+            )
 
     patches = (
         backend_config.get("train_yaml_patches")
@@ -1029,10 +1164,6 @@ def find_checkpoint(out_dir: Path, before_files: Optional[set[Path]] = None) -> 
 # =============================================================================
 
 
-def load_base_liteloc_yaml(base_yaml_path: Path) -> Dict[str, Any]:
-    return read_yaml(base_yaml_path)
-
-
 def detect_infer_execution(runtime: LiteLocRuntime, profile: Dict[str, Any]) -> str:
     value = (
         get_nested(runtime.backend_config, "execution", "infer")
@@ -1063,22 +1194,23 @@ def build_runtime_liteloc_infer_yaml(
         or get_nested(profile, "inference", "base_yaml")
     )
 
-    if not base_yaml_value:
-        raise KeyError(
-            "Missing LiteLoc base inference YAML. Set liteloc.base_infer_yaml "
-            "or inference.base_yaml in the profile."
-        )
-
-    base_yaml_path = resolve_path(base_yaml_value, base_dir=repo_dir)
+    config, config_source = load_liteloc_runtime_yaml(
+        stage="infer",
+        profile=profile,
+        base_yaml_value=base_yaml_value,
+        base_dir=repo_dir,
+        required_sections=("Loc_Model", "Multi_Process"),
+    )
 
     model_path_value = (
         backend_config.get("model_path")
         or backend_config.get("checkpoint_path")
         or get_nested(profile, "liteloc", "model_path")
         or get_nested(profile, "inference", "model_path")
+        or get_nested(config, "Loc_Model", "model_path")
     )
 
-    if not model_path_value:
+    if not model_path_value or is_auto_value(model_path_value):
         raise KeyError(
             "Missing LiteLoc model checkpoint. Provide it through registry/latest_model.json, "
             "profile.inference.model_path, or profile.liteloc.model_path."
@@ -1098,13 +1230,17 @@ def build_runtime_liteloc_infer_yaml(
         profile,
         "output",
         "runtime_infer_yaml_name",
-        default="runtime_liteloc_infer.yaml",
+        default=get_nested(
+            profile,
+            "output",
+            "runtime_yaml_name",
+            default="runtime_liteloc_infer.yaml",
+        ),
     )
 
     raw_output_path = out_dir / str(raw_output_name)
     runtime_yaml_path = out_dir / str(runtime_yaml_name)
 
-    config = load_base_liteloc_yaml(base_yaml_path)
     config.setdefault("Loc_Model", {})
     config.setdefault("Multi_Process", {})
 
@@ -1146,7 +1282,7 @@ def build_runtime_liteloc_infer_yaml(
     write_yaml(config, runtime_yaml_path)
 
     resolved_config = {
-        "base_yaml_path": str(base_yaml_path),
+        "config_source": config_source,
         "model_path": str(model_path),
         "runtime_yaml_path": str(runtime_yaml_path),
         "raw_output_path": str(raw_output_path),

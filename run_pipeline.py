@@ -51,6 +51,7 @@ Important:
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import hashlib
 import importlib
@@ -236,12 +237,7 @@ def discover_tiff_movies(
 # =============================================================================
 
 
-def load_profile(profile_path: Path) -> Dict[str, Any]:
-    profile_path = profile_path.expanduser().resolve()
-
-    if not profile_path.exists():
-        raise FileNotFoundError(f"Profile not found: {profile_path}")
-
+def read_profile_yaml(profile_path: Path) -> Dict[str, Any]:
     try:
         import yaml
     except ImportError as exc:
@@ -255,6 +251,54 @@ def load_profile(profile_path: Path) -> Dict[str, Any]:
     if not isinstance(profile, dict):
         raise ValueError(f"Profile is not a YAML dictionary: {profile_path}")
 
+    return profile
+
+
+def deep_merge_profile(base: Dict[str, Any], override: Mapping[str, Any]) -> Dict[str, Any]:
+    merged = copy.deepcopy(base)
+    for key, value in override.items():
+        if key == "extends":
+            continue
+        if isinstance(value, Mapping) and isinstance(merged.get(key), dict):
+            merged[key] = deep_merge_profile(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def load_profile_with_extends(
+    profile_path: Path,
+    stack: Optional[List[Path]] = None,
+) -> Dict[str, Any]:
+    profile_path = profile_path.expanduser().resolve()
+    stack = stack or []
+
+    if profile_path in stack:
+        chain = " -> ".join(str(path) for path in [*stack, profile_path])
+        raise ValueError(f"Profile extends cycle detected: {chain}")
+    if not profile_path.exists():
+        raise FileNotFoundError(f"Profile not found: {profile_path}")
+
+    profile = read_profile_yaml(profile_path)
+    extends_value = profile.get("extends")
+    if not extends_value:
+        return profile
+
+    parents = extends_value if isinstance(extends_value, list) else [extends_value]
+    merged: Dict[str, Any] = {}
+    for parent in parents:
+        parent_path = Path(str(parent)).expanduser()
+        if not parent_path.is_absolute():
+            parent_path = profile_path.parent / parent_path
+        parent_profile = load_profile_with_extends(parent_path, [*stack, profile_path])
+        merged = deep_merge_profile(merged, parent_profile)
+
+    return deep_merge_profile(merged, profile)
+
+
+def load_profile(profile_path: Path) -> Dict[str, Any]:
+    profile_path = profile_path.expanduser().resolve()
+    profile = load_profile_with_extends(profile_path)
     profile["profile_path"] = str(profile_path)
     profile["profile_loaded"] = True
     return profile
@@ -375,7 +419,10 @@ def infer_export_setting(profile: Mapping[str, Any], name: str) -> Optional[bool
     return None
 
 
-def profile_cli_overrides(profile: Mapping[str, Any]) -> Dict[str, Any]:
+def profile_cli_overrides(
+    profile: Mapping[str, Any],
+    extra_overrides: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
     """
     Runtime overrides come from profile fields, not public CLI paths.
     This keeps the user interface friendly while still giving the resolver what it needs.
@@ -387,12 +434,34 @@ def profile_cli_overrides(profile: Mapping[str, Any]) -> Dict[str, Any]:
             profile, ["experiment", "dimensionality"], None
         )
         or get_nested(profile, ["psf", "dimensionality"], None),
-        "device": get_nested(profile, ["inference", "device"], None),
-        "batch_size": get_nested(profile, ["inference", "batch_size"], None),
+        "calibration_mode": get_nested(profile, ["calibration", "mode"], None)
+        or get_nested(profile, ["psf", "calibration_mode"], None),
+        "z_step_nm": get_nested(profile, ["calibration", "z_step_nm"], None)
+        or get_nested(profile, ["psf", "z_step_nm"], None),
+        "device": get_nested(profile, ["training", "device"], None)
+        or get_nested(profile, ["inference", "device"], None),
+        "batch_size": get_nested(profile, ["inference", "batch_size"], None)
+        or get_nested(profile, ["liteloc", "runtime", "batch_size"], None),
         "threshold": get_nested(profile, ["inference", "threshold"], None),
+        "time_block_gb": get_nested(profile, ["inference", "time_block_gb"], None)
+        or get_nested(profile, ["liteloc", "runtime", "time_block_gb"], None),
+        "sub_fov_size": get_nested(profile, ["inference", "sub_fov_size"], None)
+        or get_nested(profile, ["liteloc", "runtime", "sub_fov_size"], None),
+        "over_cut": get_nested(profile, ["inference", "over_cut"], None)
+        or get_nested(profile, ["liteloc", "runtime", "over_cut"], None),
+        "data_queue_size": get_nested(profile, ["inference", "data_queue_size"], None)
+        or get_nested(profile, ["liteloc", "runtime", "data_queue_size"], None),
+        "multi_gpu": get_nested(profile, ["inference", "multi_gpu"], None)
+        or get_nested(profile, ["liteloc", "runtime", "multi_gpu"], None),
+        "num_producers": get_nested(profile, ["inference", "num_producers"], None)
+        or get_nested(profile, ["liteloc", "runtime", "num_producers"], None),
+        "end_frame_num": get_nested(profile, ["inference", "end_frame_num"], None)
+        or get_nested(profile, ["liteloc", "runtime", "end_frame_num"], None),
         "coord_units": infer_coord_units(profile),
         "pixel_size_nm": infer_pixel_size_nm(profile),
     }
+    if extra_overrides:
+        values.update(dict(extra_overrides))
     return {k: v for k, v in values.items() if v is not None}
 
 
@@ -480,6 +549,7 @@ def resolve_backend_runtime_config(
     profile: Dict[str, Any],
     backend_name: str,
     folders: RunFolders,
+    extra_cli_overrides: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Resolve backend runtime automatically.
@@ -491,7 +561,7 @@ def resolve_backend_runtime_config(
         global registry under outputs/registry
         current run folders
     """
-    cli_overrides = profile_cli_overrides(profile)
+    cli_overrides = profile_cli_overrides(profile, extra_cli_overrides)
     backend_paths_file = default_backend_paths_file().resolve()
 
     resolver, import_message = import_optional_module("adapters.resolver")
@@ -1071,10 +1141,12 @@ def write_artifact_snapshot(
     registry["updated_at"] = now_iso()
     write_json(registry, global_artifacts_path)
 
-    if step == "calibrate" and status in {"passed", "warning"}:
+    if step == "calibrate" and status == "passed" and artifact.get("calibration_file"):
         write_json(artifact, global_dir / "latest_calibration.json")
-    elif step == "train" and status in {"passed", "warning"}:
+    elif step == "train" and status == "passed" and artifact.get("model_path"):
         write_json(artifact, global_dir / "latest_model.json")
+    elif step == "infer" and status in {"passed", "warning"}:
+        write_json(artifact, global_dir / "latest_results.json")
 
     return artifact
 
@@ -1108,11 +1180,16 @@ def prepare_run_context(
         },
     )
 
+    extra_cli_overrides: Dict[str, Any] = {}
+    if getattr(args, "calib_mode", None):
+        extra_cli_overrides["calibration_mode"] = args.calib_mode
+
     backend_config = resolve_backend_runtime_config(
         step=step,
         profile=profile,
         backend_name=backend_name,
         folders=folders,
+        extra_cli_overrides=extra_cli_overrides,
     )
 
     profile["_runtime"] = {"backend": backend_config}
@@ -1233,7 +1310,7 @@ def run_calibrate(args: argparse.Namespace) -> Dict[str, Any]:
         "passed"
         if backend_result.get("calibrate_status") == "passed"
         or backend_result.get("backend_status") == "passed"
-        else "warning"
+        else "failed"
     )
 
     artifact = write_artifact_snapshot(
@@ -1314,7 +1391,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, Any]:
         "passed"
         if backend_result.get("train_status") == "passed"
         or backend_result.get("backend_status") == "passed"
-        else "warning"
+        else "failed"
     )
 
     artifact = write_artifact_snapshot(
@@ -1411,10 +1488,12 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
         base_row: Dict[str, Any] = {
             "batch_index": index,
             "batch_id": batch_id,
+            "run_id": batch_id,
             "input_path": str(movie_path),
             "input_name": movie_path.name,
             "input_parent": str(movie_path.parent),
             "batch_dir": str(batch_out_dir),
+            "run_dir": str(batch_out_dir),
             "profile_path": str(profile_path),
             "backend_name": backend_name,
             "coord_units_requested": coord_units,

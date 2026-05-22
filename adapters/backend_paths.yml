@@ -3,7 +3,7 @@
 # Edit this once per lab machine.
 
 liteloc:
-  root: /common_data/conda_envs/LiteLoc
+  root: null  # Set this once per machine, for example: C:/tools/LiteLoc
 
   modules:
     vector_calibration: utils/vectorpsf_fit.py
