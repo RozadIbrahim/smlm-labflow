@@ -1,13 +1,10 @@
 # requirements/remote.txt
 # Vast.ai / Docker Python dependencies.
-# Pip-only file. Conda/system packages belong in docker/Dockerfile.vast.
-
---extra-index-url https://download.pytorch.org/whl/cu121
-
-# PyTorch CUDA 12.1 stack
-torch==2.2.2+cu121
-torchvision==0.17.2+cu121
-torchaudio==2.2.2+cu121
+#
+# PyTorch is provided by the Docker base image:
+#   pytorch/pytorch:2.2.2-cuda12.1-cudnn8-runtime
+#
+# This file installs only the remaining Python dependencies.
 
 # Scientific stack
 numpy==1.24.4
@@ -21,8 +18,8 @@ imageio
 pillow
 tqdm
 natsort
-omegaconf
-PyYAML
+omegaconf==2.3.0
+PyYAML==6.0.2
 psutil
 
 # LiteLoc/helper dependencies
