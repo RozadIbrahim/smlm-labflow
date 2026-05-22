@@ -24,8 +24,29 @@ RUN echo "===== /tmp/remote.txt =====" && \
     echo "===== Python / pip versions =====" && \
     python --version && \
     python -m pip --version && \
-    echo "===== Installing remaining Python dependencies =====" && \
-    python -m pip install --no-cache-dir --prefer-binary -r /tmp/remote.txt
+    echo "===== Installing main Python dependencies =====" && \
+    python -m pip install --no-cache-dir --prefer-binary -r /tmp/remote.txt && \
+    echo "===== Installing hdfdict without dependency resolver =====" && \
+    python -m pip install --no-cache-dir --no-deps hdfdict==0.3.1 && \
+    echo "===== Import smoke test =====" && \
+    python - <<'PY'
+import torch
+import yaml
+import numpy
+import pandas
+import tifffile
+import h5py
+import hdfdict
+import omegaconf
+
+print("Torch:", torch.__version__)
+print("CUDA build:", torch.version.cuda)
+print("PyYAML:", yaml.__version__)
+print("NumPy:", numpy.__version__)
+print("pandas:", pandas.__version__)
+print("h5py:", h5py.__version__)
+print("hdfdict import: OK")
+PY
 
 COPY . /workspace/smlm-labflow
 
