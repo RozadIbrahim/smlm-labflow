@@ -1,20 +1,22 @@
+cat > requirements/remote.txt <<'TXT'
 # requirements/remote.txt
 # Vast.ai / Docker Python dependencies.
 #
-# This file is pip-only.
+# Pip-only file.
 # Do not put Conda-only syntax here:
 #   - python=3.9
 #   - pip
 #   - git
 # Those are handled by docker/Dockerfile.vast.
 
---index-url https://download.pytorch.org/whl/cu121
---extra-index-url https://pypi.org/simple
+# PyTorch CUDA 12.1 wheels.
+# PyTorch official previous-version install syntax uses the cu121 wheel index.
+--extra-index-url https://download.pytorch.org/whl/cu121
 
 # PyTorch CUDA 12.1 stack
-torch==2.2.2
-torchvision==0.17.2
-torchaudio==2.2.2
+torch==2.2.2+cu121
+torchvision==0.17.2+cu121
+torchaudio==2.2.2+cu121
 
 # Scientific stack
 numpy==1.24.4
@@ -38,5 +40,6 @@ psutil
 Deprecated
 dotted-dict
 hdfdict
-recursivenamespace
+RecursiveNamespace
 thop
+TXT
