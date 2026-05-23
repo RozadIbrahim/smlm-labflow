@@ -83,6 +83,11 @@ TIFF_EXTENSIONS = (
     ".ome.tif",
     ".ome.tiff",
 )
+CALIBRATION_FILE_EXTENSIONS = (
+    ".mat",
+    ".h5",
+    ".hdf5",
+)
 
 VALID_STEPS = {"calibrate", "train", "infer"}
 DEFAULT_BACKEND = "liteloc"
@@ -106,10 +111,15 @@ def is_tiff(path: Path) -> bool:
     return path.is_file() and name.endswith(TIFF_EXTENSIONS)
 
 
+def is_calibration_file(path: Path) -> bool:
+    name = path.name.lower()
+    return path.is_file() and name.endswith(CALIBRATION_FILE_EXTENSIONS)
+
+
 def safe_stem(path: Path) -> str:
     name = path.name
 
-    for ext in [".ome.tiff", ".ome.tif", ".tiff", ".tif"]:
+    for ext in [".ome.tiff", ".ome.tif", ".tiff", ".tif", ".hdf5", ".h5", ".mat"]:
         if name.lower().endswith(ext):
             name = name[: -len(ext)]
             break
@@ -230,6 +240,198 @@ def discover_tiff_movies(
         movies = movies[:max_files]
 
     return movies
+
+
+def discover_calibration_inputs(
+    input_path: Path,
+    profile: Mapping[str, Any],
+    backend_config: Mapping[str, Any],
+    recursive: bool = False,
+    max_files: Optional[int] = None,
+) -> List[Path]:
+    """
+    Resolve calibration inputs from either one file or a parent folder.
+
+    Vector-bead calibration consumes TIFF stacks. Spline-file calibration
+    consumes existing .mat/.h5/.hdf5 calibration artifacts. Analytic/no-external
+    calibration keeps the user-provided path as a single bookkeeping input.
+    """
+    input_path = input_path.expanduser().resolve()
+    mode = str(
+        backend_config.get("calibration_mode")
+        or get_nested(profile, ["calibration", "mode"], "auto")
+        or "auto"
+    ).strip().lower().replace("-", "_")
+
+    if input_path.is_file():
+        if is_tiff(input_path) or is_calibration_file(input_path):
+            return [input_path]
+        raise ValueError(
+            f"Calibration input file must be TIFF/OME-TIFF, .mat, .h5, or .hdf5: {input_path}"
+        )
+
+    if not input_path.is_dir():
+        raise FileNotFoundError(f"Input path does not exist: {input_path}")
+
+    if mode in {"none", "analytic"}:
+        return [input_path]
+
+    if mode == "spline_file":
+        items = [p.resolve() for p in input_path.rglob("*") if is_calibration_file(p)]
+    elif mode in {"auto", ""}:
+        items = [p.resolve() for p in input_path.rglob("*") if is_tiff(p)]
+        if not items:
+            items = [
+                p.resolve() for p in input_path.rglob("*") if is_calibration_file(p)
+            ]
+    else:
+        items = [p.resolve() for p in input_path.rglob("*") if is_tiff(p)]
+
+    items = sorted(items, key=lambda p: str(p).lower())
+
+    if not recursive:
+        if len(items) == 1:
+            return items
+        if len(items) > 1:
+            raise RuntimeError(
+                "Calibration folder is ambiguous: found "
+                f"{len(items)} candidate input files under {input_path}. "
+                "Point -i to one calibration file, or use --recursive-inputs "
+                "only when you intentionally want one calibration run per file."
+            )
+
+    if max_files is not None:
+        items = items[:max_files]
+
+    if not items:
+        if mode == "spline_file":
+            raise RuntimeError(
+                f"No .mat/.h5/.hdf5 calibration files found recursively in: {input_path}"
+            )
+        raise RuntimeError(f"No TIFF/OME-TIFF files found recursively in: {input_path}")
+
+    return items
+
+
+def discover_training_inputs(
+    input_path: Path,
+    recursive: bool = False,
+    max_files: Optional[int] = None,
+) -> List[Path]:
+    input_path = input_path.expanduser().resolve()
+    if input_path.is_file():
+        if not is_tiff(input_path):
+            raise ValueError(f"Training input file is not TIFF/OME-TIFF: {input_path}")
+        return [input_path]
+
+    if not input_path.is_dir():
+        raise FileNotFoundError(f"Input path does not exist: {input_path}")
+
+    if not recursive:
+        return [input_path]
+
+    items = [p.resolve() for p in input_path.rglob("*") if is_tiff(p)]
+    items = sorted(items, key=lambda p: str(p).lower())
+
+    if max_files is not None:
+        items = items[:max_files]
+
+    if not items:
+        raise RuntimeError(f"No TIFF/OME-TIFF files found recursively in: {input_path}")
+
+    return items
+
+
+def output_dir_for_item(
+    *,
+    root_results_dir: Path,
+    collection_name: str,
+    item_path: Path,
+    index: int,
+    total: int,
+) -> Path:
+    if total == 1:
+        return root_results_dir
+    return root_results_dir / collection_name / make_batch_id(item_path, index)
+
+
+def summarize_batch_status(
+    rows: Sequence[Mapping[str, Any]],
+    status_key: str,
+) -> Tuple[str, int, int]:
+    passed = sum(str(row.get(status_key, "")).lower() == "passed" for row in rows)
+    failed = len(rows) - passed
+    if passed == len(rows):
+        status = "passed"
+    elif passed > 0:
+        status = "warning"
+    else:
+        status = "failed"
+    return status, passed, failed
+
+
+def max_files_arg(args: argparse.Namespace) -> Optional[int]:
+    value = getattr(args, "max_files", None)
+    if value is None:
+        return None
+    if value < 1:
+        raise ValueError("--max-files must be >= 1")
+    return int(value)
+
+
+def bool_from_config(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def profile_recursive_inputs_enabled(profile: Mapping[str, Any], step: str) -> bool:
+    candidates = [
+        get_nested(profile, ["input", "recursive_inputs"], None),
+        get_nested(profile, ["input", "recursive"], None),
+        get_nested(profile, ["input", step, "recursive_inputs"], None),
+        get_nested(profile, ["input", step, "recursive"], None),
+        get_nested(profile, [step, "recursive_inputs"], None),
+        get_nested(profile, [step, "recursive"], None),
+    ]
+    if step == "calibrate":
+        candidates.extend(
+            [
+                get_nested(profile, ["calibration", "recursive_inputs"], None),
+                get_nested(profile, ["calibration", "recursive"], None),
+            ]
+        )
+    elif step == "train":
+        candidates.extend(
+            [
+                get_nested(profile, ["training", "recursive_inputs"], None),
+                get_nested(profile, ["training", "recursive"], None),
+            ]
+        )
+
+    for value in candidates:
+        if value is not None:
+            return bool_from_config(value)
+    return False
+
+
+def recursive_inputs_enabled(
+    args: argparse.Namespace,
+    profile: Mapping[str, Any],
+    step: str,
+) -> bool:
+    if step == "infer":
+        return True
+    if bool(getattr(args, "recursive_inputs", False)):
+        return True
+    return profile_recursive_inputs_enabled(profile, step)
 
 
 # =============================================================================
@@ -1358,7 +1560,7 @@ def print_header(
     folders: RunFolders,
     backend_name: str,
     backend_config: Mapping[str, Any],
-    n_movies: Optional[int] = None,
+    n_inputs: Optional[int] = None,
 ) -> None:
     print("=" * 70)
     print(f"SMLM LabFlow pipeline — {step}")
@@ -1378,8 +1580,8 @@ def print_header(
     print(f"Calibration:  {display_path(backend_config.get('calibration_file', ''))}")
     print(f"Model:        {display_path(backend_config.get('model_path', ''))}")
     print(f"Device:       {backend_config.get('device', '')}")
-    if n_movies is not None:
-        print(f"Movies:       {n_movies}")
+    if n_inputs is not None:
+        print(f"Inputs:       {n_inputs}")
     print("=" * 70)
     print()
 
@@ -1391,6 +1593,7 @@ def dry_run_result(
     folders: RunFolders,
     backend_config: Mapping[str, Any],
     movies: Optional[List[Path]] = None,
+    recursive_inputs: Optional[bool] = None,
 ) -> Dict[str, Any]:
     result = {
         "status": "dry_run",
@@ -1402,7 +1605,10 @@ def dry_run_result(
         "run_folder": folders.as_dict(),
         "resolved_backend_config": dict(backend_config),
         "profile_name": profile.get("profile_name", ""),
+        "recursive_inputs": recursive_inputs,
+        "n_inputs_detected": len(movies) if movies is not None else None,
         "n_movies_detected": len(movies) if movies is not None else None,
+        "inputs": [str(movie) for movie in movies] if movies is not None else [],
         "movies": [str(movie) for movie in movies] if movies is not None else [],
     }
     print_header(
@@ -1412,7 +1618,7 @@ def dry_run_result(
         folders=folders,
         backend_name=backend_name,
         backend_config=backend_config,
-        n_movies=len(movies) if movies is not None else None,
+        n_inputs=len(movies) if movies is not None else None,
     )
     print("Dry run enabled. Nothing was executed.")
     print("Planned parent run folder:")
@@ -1425,32 +1631,124 @@ def run_calibrate(args: argparse.Namespace) -> Dict[str, Any]:
     profile, backend_name, folders, backend_config = prepare_run_context(args)
     input_path = Path(args.i).expanduser().resolve()
     profile_path = Path(args.p).expanduser().resolve()
+    calibration_recursive = recursive_inputs_enabled(args, profile, "calibrate")
+    calibration_inputs = discover_calibration_inputs(
+        input_path,
+        profile=profile,
+        backend_config=backend_config,
+        recursive=calibration_recursive,
+        max_files=max_files_arg(args),
+    )
 
     if args.dry_run:
-        return dry_run_result(args, profile, backend_name, folders, backend_config)
+        return dry_run_result(
+            args,
+            profile,
+            backend_name,
+            folders,
+            backend_config,
+            movies=calibration_inputs,
+            recursive_inputs=calibration_recursive,
+        )
 
     print_header(
-        "calibrate", input_path, profile_path, folders, backend_name, backend_config
+        "calibrate",
+        input_path,
+        profile_path,
+        folders,
+        backend_name,
+        backend_config,
+        n_inputs=len(calibration_inputs),
     )
     write_run_status(folders, status="running", message="Calibration started.")
 
     bench = RuntimeBenchmark(out_dir=folders.benchmarks)
+    rows: List[Dict[str, Any]] = []
+    total_inputs = len(calibration_inputs)
 
-    movies = discover_tiff_movies(input_path)
-    for index, movie_path in enumerate(movies, start=1):
-        bench.benchmark_input_movie(movie_path, batch_index=index)
-
-    with bench.stage(
-        "backend_calibrate", input_path=input_path, out_dir=folders.results
-    ):
-        backend_result = run_backend_step(
-            step="calibrate",
-            backend_name=backend_name,
-            input_path=input_path,
-            out_dir=folders.results,
-            profile=profile,
-            backend_config=backend_config,
+    for index, calibration_path in enumerate(calibration_inputs, start=1):
+        item_out_dir = output_dir_for_item(
+            root_results_dir=folders.results,
+            collection_name="calibrations",
+            item_path=calibration_path,
+            index=index,
+            total=total_inputs,
         )
+        item_out_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"[{index}/{total_inputs}] {calibration_path.name}")
+        if is_tiff(calibration_path):
+            bench.benchmark_input_movie(calibration_path, batch_index=index)
+
+        with bench.stage(
+            "backend_calibrate",
+            batch_index=index,
+            input_path=calibration_path,
+            out_dir=item_out_dir,
+        ):
+            item_result = run_backend_step(
+                step="calibrate",
+                backend_name=backend_name,
+                input_path=calibration_path,
+                out_dir=item_out_dir,
+                profile=profile,
+                backend_config=backend_config,
+                batch_index=index,
+            )
+
+        row: Dict[str, Any] = {
+            "batch_index": index,
+            "batch_id": make_batch_id(calibration_path, index),
+            "input_path": str(calibration_path),
+            "input_name": calibration_path.name,
+            "input_parent": str(calibration_path.parent),
+            "batch_dir": str(item_out_dir),
+            "profile_path": str(profile_path),
+            "backend_name": backend_name,
+            "created_at": now_iso(),
+        }
+        row.update(item_result)
+        rows.append(row)
+        print(f"    Calibration: {item_result.get('calibrate_status')}")
+
+    manifest_csv = folders.results / "calibration_batch_manifest.csv"
+    manifest_json = folders.results / "calibration_batch_manifest.json"
+    write_manifest_csv(rows, manifest_csv)
+    write_json(rows, manifest_json)
+
+    calibration_files = [
+        str(row.get("calibration_file", ""))
+        for row in rows
+        if str(row.get("calibration_file", "")).strip()
+        and row.get("calibrate_status") == "passed"
+    ]
+    primary_calibration = calibration_files[0] if calibration_files else ""
+    backend_status, passed_count, failed_count = summarize_batch_status(
+        rows, "calibrate_status"
+    )
+    backend_result = {
+        "backend_name": backend_name,
+        "backend_status": backend_status,
+        "calibrate_status": backend_status,
+        "input_path": str(input_path),
+        "n_inputs": total_inputs,
+        "recursive_inputs": calibration_recursive,
+        "n_passed": passed_count,
+        "n_failed": failed_count,
+        "calibration_file": primary_calibration,
+        "primary_calibration_file": primary_calibration,
+        "calibration_files": calibration_files,
+        "batch_manifest_csv": str(manifest_csv),
+        "batch_manifest_json": str(manifest_json),
+        "batch_results": rows,
+        "message": (
+            "Calibration completed for all discovered inputs."
+            if backend_status == "passed" and calibration_recursive
+            else "Calibration completed for the selected calibration input."
+            if backend_status == "passed"
+            else "Calibration completed with failures. Check calibration_batch_manifest.csv."
+        ),
+    }
 
     quality_result = run_quality_metrics_safely(
         step="calibrate",
@@ -1466,12 +1764,7 @@ def run_calibrate(args: argparse.Namespace) -> Dict[str, Any]:
     )
 
     benchmark_summary = bench.finalize()
-    status = (
-        "passed"
-        if backend_result.get("calibrate_status") == "passed"
-        or backend_result.get("backend_status") == "passed"
-        else "failed"
-    )
+    status = str(backend_result.get("calibrate_status") or "failed")
     if status == "passed" and quality_result.get("status") in {"fail", "error"}:
         status = "warning"
 
@@ -1497,7 +1790,11 @@ def run_calibrate(args: argparse.Namespace) -> Dict[str, Any]:
         "benchmarks_dir": str(folders.benchmarks),
         "reports_dir": str(folders.reports),
         "registry_dir": str(folders.registry),
-        "n_input_movies": len(movies),
+        "n_inputs": total_inputs,
+        "recursive_inputs": calibration_recursive,
+        "n_input_movies": sum(is_tiff(path) for path in calibration_inputs),
+        "batch_manifest_csv": str(manifest_csv),
+        "batch_manifest_json": str(manifest_json),
         "backend_result": backend_result,
         "quality_metrics": quality_result,
         "benchmark": benchmark_summary,
@@ -1524,30 +1821,128 @@ def run_train(args: argparse.Namespace) -> Dict[str, Any]:
     profile, backend_name, folders, backend_config = prepare_run_context(args)
     input_path = Path(args.i).expanduser().resolve()
     profile_path = Path(args.p).expanduser().resolve()
+    training_recursive = recursive_inputs_enabled(args, profile, "train")
+    training_inputs = discover_training_inputs(
+        input_path,
+        recursive=training_recursive,
+        max_files=max_files_arg(args),
+    )
 
     if args.dry_run:
-        return dry_run_result(args, profile, backend_name, folders, backend_config)
+        return dry_run_result(
+            args,
+            profile,
+            backend_name,
+            folders,
+            backend_config,
+            movies=training_inputs,
+            recursive_inputs=training_recursive,
+        )
 
     print_header(
-        "train", input_path, profile_path, folders, backend_name, backend_config
+        "train",
+        input_path,
+        profile_path,
+        folders,
+        backend_name,
+        backend_config,
+        n_inputs=len(training_inputs),
     )
     write_run_status(folders, status="running", message="Training started.")
 
     bench = RuntimeBenchmark(out_dir=folders.benchmarks)
+    rows: List[Dict[str, Any]] = []
+    total_inputs = len(training_inputs)
 
-    movies = discover_tiff_movies(input_path)
-    for index, movie_path in enumerate(movies, start=1):
-        bench.benchmark_input_movie(movie_path, batch_index=index)
-
-    with bench.stage("backend_train", input_path=input_path, out_dir=folders.results):
-        backend_result = run_backend_step(
-            step="train",
-            backend_name=backend_name,
-            input_path=input_path,
-            out_dir=folders.results,
-            profile=profile,
-            backend_config=backend_config,
+    for index, train_path in enumerate(training_inputs, start=1):
+        item_out_dir = output_dir_for_item(
+            root_results_dir=folders.results,
+            collection_name="trainings",
+            item_path=train_path,
+            index=index,
+            total=total_inputs,
         )
+        item_out_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"[{index}/{total_inputs}] {train_path.name}")
+        if is_tiff(train_path):
+            bench.benchmark_input_movie(train_path, batch_index=index)
+        else:
+            for bench_index, movie_path in enumerate(
+                discover_tiff_movies(train_path, max_files=max_files_arg(args)),
+                start=1,
+            ):
+                bench.benchmark_input_movie(movie_path, batch_index=bench_index)
+
+        with bench.stage(
+            "backend_train",
+            batch_index=index,
+            input_path=train_path,
+            out_dir=item_out_dir,
+        ):
+            item_result = run_backend_step(
+                step="train",
+                backend_name=backend_name,
+                input_path=train_path,
+                out_dir=item_out_dir,
+                profile=profile,
+                backend_config=backend_config,
+                batch_index=index,
+            )
+
+        row = {
+            "batch_index": index,
+            "batch_id": make_batch_id(train_path, index),
+            "input_path": str(train_path),
+            "input_name": train_path.name,
+            "input_parent": str(train_path.parent),
+            "batch_dir": str(item_out_dir),
+            "profile_path": str(profile_path),
+            "backend_name": backend_name,
+            "created_at": now_iso(),
+        }
+        row.update(item_result)
+        rows.append(row)
+        print(f"    Training: {item_result.get('train_status')}")
+
+    manifest_csv = folders.results / "training_batch_manifest.csv"
+    manifest_json = folders.results / "training_batch_manifest.json"
+    write_manifest_csv(rows, manifest_csv)
+    write_json(rows, manifest_json)
+
+    model_files = [
+        str(row.get("model_path", ""))
+        for row in rows
+        if str(row.get("model_path", "")).strip()
+        and row.get("train_status") == "passed"
+    ]
+    primary_model = model_files[0] if model_files else ""
+    backend_status, passed_count, failed_count = summarize_batch_status(
+        rows, "train_status"
+    )
+    backend_result = {
+        "backend_name": backend_name,
+        "backend_status": backend_status,
+        "train_status": backend_status,
+        "input_path": str(input_path),
+        "n_inputs": total_inputs,
+        "recursive_inputs": training_recursive,
+        "n_passed": passed_count,
+        "n_failed": failed_count,
+        "model_path": primary_model,
+        "primary_model_path": primary_model,
+        "model_files": model_files,
+        "batch_manifest_csv": str(manifest_csv),
+        "batch_manifest_json": str(manifest_json),
+        "batch_results": rows,
+        "message": (
+            "Training completed for all discovered inputs."
+            if backend_status == "passed" and training_recursive
+            else "Training completed for the provided input as one training job."
+            if backend_status == "passed"
+            else "Training completed with failures. Check training_batch_manifest.csv."
+        ),
+    }
 
     quality_result = run_quality_metrics_safely(
         step="train",
@@ -1564,12 +1959,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, Any]:
     )
 
     benchmark_summary = bench.finalize()
-    status = (
-        "passed"
-        if backend_result.get("train_status") == "passed"
-        or backend_result.get("backend_status") == "passed"
-        else "failed"
-    )
+    status = str(backend_result.get("train_status") or "failed")
     if status == "passed" and quality_result.get("status") in {"fail", "error"}:
         status = "warning"
 
@@ -1595,7 +1985,17 @@ def run_train(args: argparse.Namespace) -> Dict[str, Any]:
         "benchmarks_dir": str(folders.benchmarks),
         "reports_dir": str(folders.reports),
         "registry_dir": str(folders.registry),
-        "n_input_movies": len(movies),
+        "n_inputs": total_inputs,
+        "recursive_inputs": training_recursive,
+        "n_input_movies": (
+            total_inputs
+            if training_recursive
+            else len(discover_tiff_movies(input_path, max_files=max_files_arg(args)))
+            if input_path.is_dir()
+            else 1
+        ),
+        "batch_manifest_csv": str(manifest_csv),
+        "batch_manifest_json": str(manifest_json),
         "backend_result": backend_result,
         "quality_metrics": quality_result,
         "benchmark": benchmark_summary,
@@ -1622,14 +2022,21 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
     profile, backend_name, folders, backend_config = prepare_run_context(args)
     input_path = Path(args.i).expanduser().resolve()
     profile_path = Path(args.p).expanduser().resolve()
+    infer_recursive = recursive_inputs_enabled(args, profile, "infer")
 
-    movies = discover_tiff_movies(input_path, max_files=args.max_files)
+    movies = discover_tiff_movies(input_path, max_files=max_files_arg(args))
     if not movies:
         raise RuntimeError(f"No TIFF/OME-TIFF files found in: {input_path}")
 
     if args.dry_run:
         return dry_run_result(
-            args, profile, backend_name, folders, backend_config, movies=movies
+            args,
+            profile,
+            backend_name,
+            folders,
+            backend_config,
+            movies=movies,
+            recursive_inputs=infer_recursive,
         )
 
     print_header(
@@ -1639,7 +2046,7 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
         folders,
         backend_name,
         backend_config,
-        n_movies=len(movies),
+        n_inputs=len(movies),
     )
     write_run_status(folders, status="running", message="Inference started.")
 
@@ -2049,6 +2456,21 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Allow reuse of a non-empty -o folder. Use carefully.",
     )
+    parser.add_argument(
+        "--recursive-inputs",
+        action="store_true",
+        help=(
+            "For calibrate/train, intentionally process each discovered file "
+            "under a parent folder as a separate backend job. Inference is "
+            "recursive by default."
+        ),
+    )
+    parser.add_argument(
+        "--max-files",
+        type=int,
+        default=None,
+        help="Optional quick test limit for recursive TIFF/calibration-file discovery.",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2093,12 +2515,6 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     add_common_args(infer_parser)
-    infer_parser.add_argument(
-        "--max-files",
-        type=int,
-        default=None,
-        help="Optional quick test limit for inference.",
-    )
 
     return parser
 
