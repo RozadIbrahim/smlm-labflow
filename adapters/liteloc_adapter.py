@@ -69,6 +69,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -1580,9 +1581,9 @@ def run_liteloc_training(
             if train_execution == "module":
                 add_liteloc_to_syspath_and_env(runtime.repo_dir)
                 train_cls = import_from_module_file(train_module, runtime.repo_dir, train_class_name)
-                from utils.help_utils import load_yaml  # type: ignore
+                from utils.help_utils import load_yaml_train  # type: ignore
 
-                params = load_yaml(str(runtime_yaml_path))
+                params = load_yaml_train(str(runtime_yaml_path))
                 with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
                     model = train_cls(params)
                     model.train()
@@ -1605,6 +1606,10 @@ def run_liteloc_training(
         except Exception as exc:
             return_code = 1
             error = repr(exc)
+            log.write("\nLiteLoc training exception:\n")
+            log.write(traceback.format_exc())
+            log.write("\n")
+            log.flush()
 
     checkpoint = find_checkpoint(out_dir, before_files=before_files)
     copied_model = str(checkpoint) if checkpoint else ""
