@@ -1456,6 +1456,16 @@ def global_registry_dir(folders: RunFolders) -> Path:
     return folders.parent.parent / "registry"
 
 
+def latest_registry_filename(step: str, status: str, artifact: Mapping[str, Any]) -> str:
+    if step == "calibrate" and status == "passed" and artifact.get("calibration_file"):
+        return "latest_calibration.json"
+    if step == "train" and status == "passed" and artifact.get("model_path"):
+        return "latest_model.json"
+    if step == "infer" and status in {"passed", "warning"}:
+        return "latest_results.json"
+    return ""
+
+
 def artifact_id(step: str, folders: RunFolders) -> str:
     return safe_name(f"{step}_{folders.parent.name}")
 
@@ -1495,6 +1505,7 @@ def write_artifact_snapshot(
         "benchmarks_dir": str(folders.benchmarks),
         "reports_dir": str(folders.reports),
         "registry_dir": str(folders.registry),
+        "shared_registry_dir": str(global_registry_dir(folders)),
         "psf_type": backend_config.get("psf_type")
         or get_nested(profile, ["psf", "type"], None),
         "dimensionality": backend_config.get("psf_dimensionality")
@@ -1514,6 +1525,10 @@ def write_artifact_snapshot(
 
     local_artifact_path = folders.registry / "artifact.json"
     write_json(artifact, local_artifact_path)
+
+    latest_filename = latest_registry_filename(step, status, artifact)
+    if latest_filename:
+        write_json(artifact, folders.registry / latest_filename)
 
     global_dir = global_registry_dir(folders)
     global_dir.mkdir(parents=True, exist_ok=True)
@@ -1535,12 +1550,8 @@ def write_artifact_snapshot(
     registry["updated_at"] = now_iso()
     write_json(registry, global_artifacts_path)
 
-    if step == "calibrate" and status == "passed" and artifact.get("calibration_file"):
-        write_json(artifact, global_dir / "latest_calibration.json")
-    elif step == "train" and status == "passed" and artifact.get("model_path"):
-        write_json(artifact, global_dir / "latest_model.json")
-    elif step == "infer" and status in {"passed", "warning"}:
-        write_json(artifact, global_dir / "latest_results.json")
+    if latest_filename:
+        write_json(artifact, global_dir / latest_filename)
 
     return artifact
 
@@ -2245,6 +2256,9 @@ def print_footer(folders: RunFolders, summary: Mapping[str, Any]) -> None:
     print(f"Benchmarks:    {display_path(folders.benchmarks)}")
     print(f"Reports:       {display_path(folders.reports)}")
     print(f"Registry:      {display_path(folders.registry)}")
+    shared_registry = global_registry_dir(folders)
+    if shared_registry != folders.registry:
+        print(f"Shared registry: {display_path(shared_registry)}")
 
     backend_result = summary.get("backend_result", {})
     if isinstance(backend_result, Mapping) and backend_result.get("backend_status") == "failed":
