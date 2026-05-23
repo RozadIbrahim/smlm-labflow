@@ -891,7 +891,13 @@ def normalize_backend_result(
     )
     clean.setdefault("backend_status", clean.get(status_key, "passed"))
     clean.setdefault("backend_name", backend_name)
-    clean.setdefault("backend_message", message)
+    if clean.get("backend_status") == "failed":
+        clean.setdefault(
+            "backend_message",
+            clean.get("message") or clean.get("error") or message,
+        )
+    else:
+        clean.setdefault("backend_message", message)
 
     if step == "calibrate":
         artifact = (
@@ -2125,12 +2131,20 @@ def print_footer(folders: RunFolders, summary: Mapping[str, Any]) -> None:
 
     backend_result = summary.get("backend_result", {})
     if isinstance(backend_result, Mapping) and backend_result.get("backend_status") == "failed":
-        message = backend_result.get("backend_message", "")
+        message = (
+            backend_result.get("error")
+            or backend_result.get("message")
+            or backend_result.get("backend_message")
+            or ""
+        )
         log_path = backend_result.get("log_path") or backend_result.get("backend_log_path")
+        status_path = backend_result.get("status_json")
         if message:
             print(f"Backend error: {message}")
         if log_path:
             print(f"Backend log:   {display_path(log_path)}")
+        if status_path:
+            print(f"Backend JSON:  {display_path(status_path)}")
 
     benchmark = summary.get("benchmark", {})
     if isinstance(benchmark, Mapping):
