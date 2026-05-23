@@ -90,6 +90,7 @@ import deprecated
 import dotted_dict
 import recursivenamespace
 import psutil
+import pynvml
 
 print("Torch:", torch.__version__)
 print("CUDA build:", torch.version.cuda)
@@ -105,6 +106,7 @@ print("h5py-wrapper import: OK")
 print("hdfdict:", hdfdict.__version__)
 print("OmegaConf:", omegaconf.__version__)
 print("spline import: OK")
+print("pynvml import: OK")
 print("RecursiveNamespace import: OK")
 print("LiteLoc/LabFlow dependency smoke test: OK")
 PY
