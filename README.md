@@ -81,7 +81,23 @@ python run_pipeline.py calibrate -i BEAD_STACK.ome.tif -p PROFILE -o RUN_FOLDER
 python run_pipeline.py calibrate -i PSF_MODEL.h5       -p PROFILE -o RUN_FOLDER
 ```
 
-Use `--max-files N` with inference for a quick recursive smoke test.
+If a bead dataset contains multiple independent bead stacks for the same
+profile condition, use candidate mode:
+
+```bash
+python run_pipeline.py calibrate \
+  -i BEAD_STACK_PARENT \
+  -p PROFILE \
+  -o RUN_FOLDER \
+  --multi-files
+```
+
+Candidate mode runs calibration once per discovered bead stack/artifact and
+writes a manifest for comparison. It deliberately does **not** update
+`latest_calibration.json`; choose the final calibration before training.
+
+Use `--max-files N` with inference or `calibrate --multi-files` for a quick
+recursive smoke test.
 
 For now, the main backend is:
 
@@ -356,6 +372,11 @@ Typical inference outputs:
 results/
   runtime_liteloc_calibration.yaml    # calibrate
   liteloc_calibration_adapter_status.json
+  calibration_candidates_manifest.csv # calibrate --multi-files
+  calibration_candidates/
+    <candidate_id>/
+      runtime_liteloc_calibration.yaml
+      liteloc_calibration_adapter_status.json
   runtime_liteloc_train.yaml          # train
   liteloc_training_adapter_status.json
   batches/
