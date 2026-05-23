@@ -102,6 +102,10 @@ def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def progress(message: str) -> None:
+    print(f"[{now_iso()}] {message}", flush=True)
+
+
 def project_root() -> Path:
     return Path(__file__).resolve().parent
 
@@ -1813,9 +1817,38 @@ def run_train(args: argparse.Namespace) -> Dict[str, Any]:
     bench = RuntimeBenchmark(out_dir=folders.benchmarks)
 
     movies = discover_tiff_movies(training_input) if training_input.is_dir() else [training_input]
+    progress(
+        f"Training input benchmark: sampling {len(movies)} TIFF file(s) before backend."
+    )
     for index, movie_path in enumerate(movies, start=1):
-        bench.benchmark_input_movie(movie_path, batch_index=index)
+        progress(f"Training input benchmark [{index}/{len(movies)}]: {movie_path.name}")
+        write_run_status(
+            folders,
+            status="running",
+            message=f"Training input benchmark {index}/{len(movies)}.",
+        )
+        input_benchmark = bench.benchmark_input_movie(
+            movie_path,
+            batch_index=index,
+            max_sample_frames=25,
+            max_pixels_per_frame=10_000,
+        )
+        progress(
+            "Training input benchmark "
+            f"[{index}/{len(movies)}]: {input_benchmark.get('status')} "
+            f"shape={input_benchmark.get('shape')} "
+            f"sampled_frames={input_benchmark.get('sampled_frames')}"
+        )
 
+    progress(
+        "LiteLoc training backend starting. Backend output is streamed here and "
+        f"saved to {folders.results / 'liteloc_training.log'}."
+    )
+    write_run_status(
+        folders,
+        status="running",
+        message="LiteLoc training backend running.",
+    )
     with bench.stage("backend_train", input_path=training_input, out_dir=folders.results):
         backend_result = run_backend_step(
             step="train",
@@ -1825,7 +1858,9 @@ def run_train(args: argparse.Namespace) -> Dict[str, Any]:
             profile=profile,
             backend_config=backend_config,
         )
+    progress(f"LiteLoc training backend finished: {backend_result.get('backend_status')}")
 
+    progress("Training quality metrics starting.")
     quality_result = run_quality_metrics_safely(
         step="train",
         bench=bench,
@@ -1839,6 +1874,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, Any]:
             "reports_dir": folders.reports,
         },
     )
+    progress(f"Training quality metrics finished: {quality_result.get('status')}")
 
     benchmark_summary = bench.finalize()
     status = (
@@ -1942,6 +1978,12 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
         batch_out_dir.mkdir(parents=True, exist_ok=True)
 
         print(f"[{index}/{len(movies)}] {movie_path.name}")
+        progress(f"Inference batch {index}/{len(movies)} started: {movie_path.name}")
+        write_run_status(
+            folders,
+            status="running",
+            message=f"Inference batch {index}/{len(movies)} input QC.",
+        )
 
         base_row: Dict[str, Any] = {
             "batch_index": index,
@@ -1974,14 +2016,21 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
         # ------------------------------------------------------------------
         # Input QC
         # ------------------------------------------------------------------
+        progress(f"Inference batch {index}/{len(movies)} input QC starting.")
         with bench.stage(
             "input_qc", batch_index=index, input_path=movie_path, out_dir=batch_out_dir
         ):
             qc_result = run_qc_safely(qc_one_movie, movie_path, batch_out_dir)
 
-        bench.benchmark_input_movie(movie_path, batch_index=index)
+        progress(f"Inference batch {index}/{len(movies)} input benchmark starting.")
+        input_benchmark = bench.benchmark_input_movie(movie_path, batch_index=index)
         qc_status = qc_result.get("qc_status", "unknown")
         print(f"    QC: {qc_status}")
+        progress(
+            f"Inference batch {index}/{len(movies)} QC finished: {qc_status}; "
+            f"benchmark={input_benchmark.get('status')} "
+            f"sampled_frames={input_benchmark.get('sampled_frames')}"
+        )
 
         if qc_status != "passed":
             backend_result = {
@@ -2005,6 +2054,12 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
             # --------------------------------------------------------------
             # Backend inference
             # --------------------------------------------------------------
+            progress(f"Inference batch {index}/{len(movies)} backend starting.")
+            write_run_status(
+                folders,
+                status="running",
+                message=f"Inference batch {index}/{len(movies)} backend running.",
+            )
             with bench.stage(
                 "backend_inference",
                 batch_index=index,
@@ -2022,12 +2077,17 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
                 )
 
             print(f"    Backend: {backend_result.get('backend_status')}")
+            progress(
+                f"Inference batch {index}/{len(movies)} backend finished: "
+                f"{backend_result.get('backend_status')}"
+            )
             raw_output_path = backend_result.get("raw_output_path", "")
 
             if raw_output_path:
                 # ----------------------------------------------------------
                 # Post-inference conversion + exports
                 # ----------------------------------------------------------
+                progress(f"Inference batch {index}/{len(movies)} post-inference starting.")
                 with bench.stage(
                     "post_inference",
                     batch_index=index,
@@ -2050,9 +2110,16 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
                             locan_units=locan_units,
                         )
                     )
+                progress(
+                    f"Inference batch {index}/{len(movies)} post-inference finished: "
+                    f"{export_result.get('status')}"
+                )
 
                 canonical_path = canonical_result.get("canonical_output_path", "")
                 if canonical_path:
+                    progress(
+                        f"Inference batch {index}/{len(movies)} localization benchmark starting."
+                    )
                     bench.benchmark_localizations(
                         canonical_csv=canonical_path,
                         batch_index=index,
@@ -2067,6 +2134,9 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
                     )
                     bench.validate_exports(export_validation_map)
 
+                    progress(
+                        f"Inference batch {index}/{len(movies)} quality metrics starting."
+                    )
                     quality_result = run_quality_metrics_safely(
                         step="infer",
                         bench=bench,
@@ -2081,6 +2151,10 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
                                 "qc_json", str(batch_out_dir / "input_qc.json")
                             ),
                         },
+                    )
+                    progress(
+                        f"Inference batch {index}/{len(movies)} quality metrics finished: "
+                        f"{quality_result.get('status')}"
                     )
 
                     truth_csv = infer_truth_csv_for_movie(profile, movie_path, index)

@@ -108,18 +108,25 @@ def inspect_tiff(path: Path) -> Dict[str, Any]:
     }
 
     try:
-        with tifffile.TiffFile(path) as tif:
-            series = tif.series[0]
-
-            shape = tuple(int(x) for x in series.shape)
-            axes = getattr(series, "axes", None)
+        with tifffile.TiffFile(path, is_ome=False) as tif:
+            page_count = int(len(tif.pages))
+            if page_count > 1:
+                first_shape = tuple(int(x) for x in tif.pages[0].shape)
+                shape = (page_count, *first_shape)
+                axes = "TYX" if len(first_shape) == 2 else None
+                dtype = str(tif.pages[0].dtype)
+            else:
+                series = tif.series[0]
+                shape = tuple(int(x) for x in series.shape)
+                axes = getattr(series, "axes", None)
+                dtype = str(series.dtype)
 
             info["shape"] = list(shape)
             info["axes"] = axes
-            info["dtype"] = str(series.dtype)
-            info["pages"] = int(len(tif.pages))
+            info["dtype"] = dtype
+            info["pages"] = page_count
             info["series_count"] = int(len(tif.series))
-            info["is_ome"] = bool(tif.ome_metadata)
+            info["is_ome"] = ".ome." in path.name.lower()
             info["is_imagej"] = bool(tif.imagej_metadata)
 
             frame_info = guess_frames(shape, axes)
@@ -184,12 +191,28 @@ def read_sample_array(path: Path, max_frames: int = 200) -> np.ndarray:
     Read enough data for QC without trying to be clever.
 
     For huge movies:
-        - If first axis looks like frames, keep only first max_frames.
-        - Otherwise read the full array and squeeze.
+        - Multi-page TIFFs are sampled page-by-page.
+        - Single-page arrays are sliced on the first axis when it looks like frames.
 
     This is QC, not inference.
     """
-    arr = tifffile.imread(path)
+    try:
+        with tifffile.TiffFile(path, is_ome=False) as tif:
+            if len(tif.pages) > 1:
+                n_pages = len(tif.pages)
+                if n_pages <= max_frames:
+                    indices = list(range(n_pages))
+                else:
+                    indices = np.linspace(0, n_pages - 1, max_frames).astype(int).tolist()
+                return np.asarray([tif.pages[int(idx)].asarray() for idx in indices])
+
+            if len(tif.pages) == 1:
+                arr = tif.pages[0].asarray()
+            else:
+                arr = np.asarray([])
+    except Exception:
+        arr = tifffile.imread(path)
+
     arr = np.asarray(arr)
 
     if arr.ndim >= 3 and arr.shape[0] > max_frames:

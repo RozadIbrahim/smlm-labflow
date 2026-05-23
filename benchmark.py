@@ -1911,6 +1911,9 @@ def benchmark_input_movie(
         "dtype": "",
         "n_dimensions": None,
         "n_frames_guess": None,
+        "pages": None,
+        "sampled_frames": None,
+        "sampling_strategy": "",
         "min": None,
         "max": None,
         "mean": None,
@@ -1940,22 +1943,39 @@ def benchmark_input_movie(
         return row
 
     try:
-        with tifffile.TiffFile(str(input_path)) as tif:
-            series = tif.series[0]
-            shape = tuple(int(v) for v in series.shape)
-            dtype = str(series.dtype)
-            row["shape"] = list(shape)
-            row["dtype"] = dtype
-            row["n_dimensions"] = len(shape)
-            row["n_frames_guess"] = int(shape[0]) if len(shape) >= 3 else 1
-            try:
-                data = series.asarray(out="memmap")
-            except Exception:
-                data = series.asarray()
+        with tifffile.TiffFile(str(input_path), is_ome=False) as tif:
+            page_count = int(len(tif.pages))
+            row["pages"] = page_count
 
-        arr = np.asarray(data)
-        if arr.ndim >= 3:
-            n_frames = arr.shape[0]
+            if page_count <= 0:
+                row["status"] = "failed"
+                row["message"] = "TIFF has no readable pages."
+                write_or_replace_rows_csv([row], out_dir / "input_qc_benchmark.csv", {"benchmark_layer": "input_qc", "batch_index": batch_index, "input_path": str(input_path)})
+                return row
+
+            first_page = tif.pages[0]
+            first_shape = tuple(int(v) for v in first_page.shape)
+            dtype = str(first_page.dtype)
+            arr_dtype = np.dtype(first_page.dtype)
+            row["dtype"] = dtype
+
+            if page_count > 1 and len(first_shape) == 2:
+                row["shape"] = [page_count, *first_shape]
+                row["n_dimensions"] = 3
+                row["n_frames_guess"] = page_count
+                arr = None
+            else:
+                arr = np.asarray(first_page.asarray())
+                shape = tuple(int(v) for v in arr.shape)
+                row["shape"] = list(shape)
+                row["n_dimensions"] = len(shape)
+                row["n_frames_guess"] = int(shape[0]) if len(shape) >= 3 else 1
+
+            if page_count > 1 and arr is None:
+                n_frames = page_count
+            else:
+                n_frames = arr.shape[0] if arr is not None and arr.ndim >= 3 else 1
+
             if n_frames <= max_sample_frames:
                 frame_indices = list(range(n_frames))
             else:
@@ -1963,11 +1983,21 @@ def benchmark_input_movie(
                     np.linspace(0, n_frames - 1, max_sample_frames).astype(int).tolist()
                 )
 
+            row["sampled_frames"] = len(frame_indices)
+            row["sampling_strategy"] = "direct_page_sampling" if page_count > 1 and arr is None else "single_page_array_sampling"
+
             samples = []
             frame_means = []
             rng = np.random.default_rng(42)
             for idx in frame_indices:
-                frame = np.asarray(arr[idx], dtype=float)
+                if page_count > 1 and arr is None:
+                    frame = np.asarray(tif.pages[int(idx)].asarray(), dtype=float)
+                elif arr is not None and arr.ndim >= 3:
+                    frame = np.asarray(arr[int(idx)], dtype=float)
+                elif arr is not None:
+                    frame = np.asarray(arr, dtype=float)
+                else:
+                    continue
                 frame_means.append(float(np.mean(frame)))
                 flat = frame.ravel()
                 if flat.size > max_pixels_per_frame:
@@ -1996,8 +2026,6 @@ def benchmark_input_movie(
                 )
                 or ""
             )
-        else:
-            sample_values = np.asarray(arr, dtype=float).ravel()
 
         sample_values = sample_values[~np.isnan(sample_values)]
         if sample_values.size == 0:
@@ -2016,8 +2044,8 @@ def benchmark_input_movie(
 
             saturated_fraction = None
             try:
-                if np.issubdtype(arr.dtype, np.integer):
-                    max_possible = np.iinfo(arr.dtype).max
+                if np.issubdtype(arr_dtype, np.integer):
+                    max_possible = np.iinfo(arr_dtype).max
                     saturated_fraction = float(np.mean(sample_values >= max_possible))
             except Exception:
                 saturated_fraction = None

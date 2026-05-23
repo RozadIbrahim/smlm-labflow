@@ -329,6 +329,25 @@ def get_attr_or_item(obj: Any, name: str, default: Any = None) -> Any:
     return getattr(obj, name, default)
 
 
+class TeeStream:
+    """
+    Write backend output to both the persistent log and the user's terminal.
+    """
+
+    def __init__(self, *streams: Any):
+        self.streams = [stream for stream in streams if stream is not None]
+
+    def write(self, text: str) -> int:
+        for stream in self.streams:
+            stream.write(text)
+            stream.flush()
+        return len(text)
+
+    def flush(self) -> None:
+        for stream in self.streams:
+            stream.flush()
+
+
 def ensure_trailing_slash(path: Path) -> str:
     text = str(path.expanduser().resolve())
     return text if text.endswith(os.sep) else text + os.sep
@@ -1447,7 +1466,9 @@ def run_liteloc_inference_module_mode(
 
     with log_path.open("a", encoding="utf-8") as log:
         try:
-            with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+            stdout_tee = TeeStream(log, sys.stdout)
+            stderr_tee = TeeStream(log, sys.stderr)
+            with contextlib.redirect_stdout(stdout_tee), contextlib.redirect_stderr(stderr_tee):
                 analyzer = infer_cls(**kwargs)
                 t1 = time.time()
                 print(f"LiteLoc module init time: {t1 - t0:.3f} seconds")
@@ -1584,7 +1605,9 @@ def run_liteloc_training(
                 from utils.help_utils import load_yaml_train  # type: ignore
 
                 params = load_yaml_train(str(runtime_yaml_path))
-                with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+                stdout_tee = TeeStream(log, sys.stdout)
+                stderr_tee = TeeStream(log, sys.stderr)
+                with contextlib.redirect_stdout(stdout_tee), contextlib.redirect_stderr(stderr_tee):
                     model = train_cls(params)
                     model.train()
                 return_code = 0
