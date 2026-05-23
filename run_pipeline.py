@@ -135,8 +135,11 @@ def display_path(path: Path | str | None, base: Optional[Path] = None) -> str:
     if path is None:
         return ""
 
+    if isinstance(path, str) and path.strip() == "":
+        return ""
+
     path = Path(path)
-    if str(path).strip() == "":
+    if str(path).strip() in {"", "."}:
         return ""
 
     try:
@@ -802,6 +805,15 @@ def normalize_backend_result(
     return clean
 
 
+def default_backend_log_path(step: str, out_dir: Path, profile: Mapping[str, Any]) -> Path:
+    if step == "calibrate":
+        return out_dir / "liteloc_calibration.log"
+    if step == "train":
+        return out_dir / "liteloc_training.log"
+    log_name = get_nested(profile, ["output", "log_name"], "liteloc.log")
+    return out_dir / str(log_name)
+
+
 def run_backend_step(
     step: str,
     backend_name: str,
@@ -838,11 +850,13 @@ def run_backend_step(
             message=message,
         )
     except Exception as exc:
+        log_path = default_backend_log_path(step, out_dir, profile)
         return {
             "backend_status": "failed",
             f"{step}_status": "failed",
             "backend_name": backend_name,
             "backend_message": repr(exc),
+            "backend_log_path": str(log_path),
         }
 
 
@@ -1371,6 +1385,9 @@ def print_header(
     print(f"Registry:     {display_path(folders.registry)}")
     print(f"Profile:      {display_path(profile_path)}")
     print(f"Backend:      {backend_name}")
+    backend_root = backend_config.get("root") or backend_config.get("liteloc_root", "")
+    if backend_root:
+        print(f"Backend root: {display_path(backend_root)}")
     print(
         f"Resolver:     {backend_config.get('resolver_function', backend_config.get('status', ''))}"
     )
@@ -1977,6 +1994,15 @@ def print_footer(folders: RunFolders, summary: Mapping[str, Any]) -> None:
     print(f"Benchmarks:    {display_path(folders.benchmarks)}")
     print(f"Reports:       {display_path(folders.reports)}")
     print(f"Registry:      {display_path(folders.registry)}")
+
+    backend_result = summary.get("backend_result", {})
+    if isinstance(backend_result, Mapping) and backend_result.get("backend_status") == "failed":
+        message = backend_result.get("backend_message", "")
+        log_path = backend_result.get("log_path") or backend_result.get("backend_log_path")
+        if message:
+            print(f"Backend error: {message}")
+        if log_path:
+            print(f"Backend log:   {display_path(log_path)}")
 
     benchmark = summary.get("benchmark", {})
     if isinstance(benchmark, Mapping):
