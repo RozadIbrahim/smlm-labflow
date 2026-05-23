@@ -669,6 +669,94 @@ def resolve_backend_runtime_config(
     return resolved
 
 
+def validate_backend_connection(
+    step: str,
+    input_path: Path,
+    backend_name: str,
+    profile: Dict[str, Any],
+    backend_config: Dict[str, Any],
+) -> None:
+    """
+    Fail early when the configured backend cannot be reached.
+
+    This deliberately checks the real adapter runtime before starting a run, so
+    a missing LiteLoc root/module/dependency does not become a vague
+    "Pipeline complete / Status: failed" footer.
+    """
+    if backend_name.lower().strip() != "liteloc":
+        return
+
+    try:
+        from adapters import liteloc_adapter
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not import the LiteLoc adapter: {repr(exc)}"
+        ) from exc
+
+    try:
+        runtime = liteloc_adapter.resolve_liteloc_runtime(profile, backend_config)
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not connect to LiteLoc backend. Check adapters/backend_paths.yml "
+            f"and the LiteLoc installation. Resolver root was "
+            f"{backend_config.get('root') or backend_config.get('liteloc_root') or '<empty>'}. "
+            f"Original error: {repr(exc)}"
+        ) from exc
+
+    required_module = ""
+    required_attr = ""
+    if step == "calibrate":
+        mode = liteloc_adapter.infer_calibration_mode(
+            input_path,
+            profile,
+            runtime.backend_config,
+        )
+        if mode == "vector_beads":
+            required_module = "vector_calibration"
+            required_attr = runtime.functions.get(
+                "vector_calibration",
+                "beads_psf_calibrate",
+            )
+        elif mode == "spline_file":
+            required_module = "spline_calibration_io"
+            required_attr = runtime.functions.get(
+                "spline_loader_class",
+                "SMAPSplineCoefficient",
+            )
+    elif step == "train":
+        required_module = "train"
+        required_attr = runtime.functions.get("train_class", "LocModel")
+    elif step == "infer":
+        required_module = "infer"
+        required_attr = runtime.functions.get(
+            "infer_class",
+            "CompetitiveSmlmDataAnalyzer_multi_producer",
+        )
+
+    if not required_module:
+        return
+
+    module_path = runtime.modules.get(required_module)
+    if module_path is None:
+        raise RuntimeError(
+            "Could not connect to LiteLoc backend. Required module "
+            f"{required_module!r} was not found under {runtime.repo_dir}. "
+            "Check adapters/backend_paths.yml module paths."
+        )
+
+    try:
+        liteloc_adapter.import_from_module_file(
+            module_path,
+            runtime.repo_dir,
+            required_attr,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not import the required LiteLoc backend entry point "
+            f"{required_attr!r} from {module_path}. Original error: {repr(exc)}"
+        ) from exc
+
+
 # =============================================================================
 # Adapter discovery and execution
 # =============================================================================
@@ -1353,6 +1441,15 @@ def prepare_run_context(
         extra_cli_overrides=extra_cli_overrides,
     )
 
+    if not getattr(args, "dry_run", False):
+        validate_backend_connection(
+            step=step,
+            input_path=input_path,
+            backend_name=backend_name,
+            profile=profile,
+            backend_config=backend_config,
+        )
+
     profile["_runtime"] = {"backend": backend_config}
     profile["resolved_backend"] = backend_config
 
@@ -1985,10 +2082,11 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def print_footer(folders: RunFolders, summary: Mapping[str, Any]) -> None:
+    status = str(summary.get("status", ""))
     print("=" * 70)
-    print("Pipeline complete")
+    print("Pipeline failed" if status == "failed" else "Pipeline complete")
     print("=" * 70)
-    print(f"Status:        {summary.get('status', '')}")
+    print(f"Status:        {status}")
     print(f"Run folder:    {display_path(folders.parent)}")
     print(f"Results:       {display_path(folders.results)}")
     print(f"Benchmarks:    {display_path(folders.benchmarks)}")
@@ -2134,14 +2232,18 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
+        summary: Optional[Dict[str, Any]] = None
         if args.command == "calibrate":
-            run_calibrate(args)
+            summary = run_calibrate(args)
         elif args.command == "train":
-            run_train(args)
+            summary = run_train(args)
         elif args.command == "infer":
-            run_infer(args)
+            summary = run_infer(args)
         else:
             parser.error(f"Unknown command: {args.command}")
+
+        if isinstance(summary, Mapping) and summary.get("status") == "failed":
+            sys.exit(1)
 
     except KeyboardInterrupt:
         print("\nPipeline interrupted by user.")
