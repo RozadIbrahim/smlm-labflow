@@ -96,6 +96,11 @@ Candidate mode runs calibration once per discovered bead stack/artifact and
 writes a manifest for comparison. It deliberately does **not** update
 `latest_calibration.json`; choose the final calibration before training.
 
+For vector-bead calibration, LabFlow stages each bead TIFF inside the run output
+folder before calling LiteLoc. It uses a symlink first, then hardlink/copy
+fallback if needed, so LiteLoc's generated `_calib_results.mat` is captured in
+the run instead of being left beside the source dataset.
+
 Use `--max-files N` with inference or `calibrate --multi-files` for a quick
 recursive smoke test.
 
@@ -375,6 +380,8 @@ results/
   calibration_candidates_manifest.csv # calibrate --multi-files
   calibration_candidates/
     <candidate_id>/
+      <bead_stack>.ome.tif               # staged symlink/hardlink/copy
+      *_calib_results.mat
       runtime_liteloc_calibration.yaml
       liteloc_calibration_adapter_status.json
   runtime_liteloc_train.yaml          # train
