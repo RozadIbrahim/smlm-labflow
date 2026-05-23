@@ -821,25 +821,55 @@ def call_backend_function(
     backend_config: Dict[str, Any],
     batch_index: Optional[int] = None,
 ) -> Any:
+    kwargs = {
+        "step": step,
+        "command": step,
+        "input_path": input_path,
+        "movie_path": input_path,
+        "train_path": input_path,
+        "calibration_path": input_path,
+        "out_dir": out_dir,
+        "output_dir": out_dir,
+        "results_dir": out_dir,
+        "profile": profile,
+        "backend_config": backend_config,
+        "runtime_config": backend_config,
+        "batch_index": batch_index,
+    }
+
     try:
-        return call_with_supported_kwargs(
-            fn,
-            step=step,
-            command=step,
-            input_path=input_path,
-            movie_path=input_path,
-            train_path=input_path,
-            calibration_path=input_path,
-            out_dir=out_dir,
-            output_dir=out_dir,
-            results_dir=out_dir,
-            profile=profile,
-            backend_config=backend_config,
-            runtime_config=backend_config,
-            batch_index=batch_index,
-        )
-    except TypeError:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return fn(**kwargs)
+
+    parameters = signature.parameters
+    accepts_kwargs = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()
+    )
+    supported_kwargs = {
+        key: value for key, value in kwargs.items() if key in parameters
+    }
+
+    if accepts_kwargs or supported_kwargs:
+        return fn(**kwargs) if accepts_kwargs else fn(**supported_kwargs)
+
+    # Legacy positional adapter shape. Do not catch TypeError from adapter
+    # internals, because that can hide the real LiteLoc failure and retry
+    # without backend_config.
+    positional_count = sum(
+        1
+        for param in parameters.values()
+        if param.kind
+        in {
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        }
+        and param.default is inspect.Parameter.empty
+    )
+    if positional_count <= 3:
         return fn(input_path, out_dir, profile)
+
+    return fn(input_path, out_dir, profile, backend_config)
 
 
 def normalize_backend_result(
