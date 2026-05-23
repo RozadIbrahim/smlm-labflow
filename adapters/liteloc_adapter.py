@@ -259,11 +259,6 @@ def normalize_mode(value: Any, default: str = "auto") -> str:
     return str(value).strip().lower().replace("-", "_")
 
 
-def absolute_path(path: Path) -> Path:
-    """Return an absolute path without resolving symlinks."""
-    return Path(os.path.abspath(os.fspath(path.expanduser())))
-
-
 def snapshot_files(folder: Path) -> set[Path]:
     if not folder.exists():
         return set()
@@ -526,57 +521,13 @@ def resolve_liteloc_runtime(
 # =============================================================================
 
 
-def artifact_fingerprint(path: Path) -> Optional[Tuple[int, int]]:
-    try:
-        stat = path.stat()
-    except Exception:
-        return None
-    return int(stat.st_mtime_ns), int(stat.st_size)
-
-
-def artifact_name_matches(
-    path: Path,
-    suffixes: set[str],
-    name_tokens: Sequence[str] = (),
-) -> bool:
-    if path.suffix.lower() not in suffixes:
-        return False
-
-    if name_tokens and not any(token in path.name.lower() for token in name_tokens):
-        return False
-
-    return True
-
-
-def snapshot_artifacts(
-    folder: Path,
-    *,
-    suffixes: set[str],
-    name_tokens: Sequence[str] = (),
-) -> Dict[Path, Tuple[int, int]]:
-    if not folder.exists():
-        return {}
-
-    snapshot: Dict[Path, Tuple[int, int]] = {}
-    for path in folder.rglob("*"):
-        if not path.is_file() or not artifact_name_matches(path, suffixes, name_tokens):
-            continue
-
-        fingerprint = artifact_fingerprint(path)
-        if fingerprint is not None:
-            snapshot[path.resolve()] = fingerprint
-
-    return snapshot
-
-
 def find_new_artifact(
     search_dirs: Sequence[Path],
+    before_files: set[Path],
     suffixes: set[str],
-    before_files: Optional[set[Path]] = None,
-    before_artifacts: Optional[Mapping[Path, Tuple[int, int]]] = None,
     name_tokens: Sequence[str] = (),
 ) -> Optional[Path]:
-    candidates: List[Tuple[Path, Tuple[int, int]]] = []
+    candidates: List[Path] = []
 
     for folder in search_dirs:
         if not folder.exists():
@@ -586,26 +537,22 @@ def find_new_artifact(
             if not path.is_file():
                 continue
 
-            if not artifact_name_matches(path, suffixes, name_tokens):
-                continue
-
             resolved = path.resolve()
-            fingerprint = artifact_fingerprint(path)
-            if fingerprint is None:
+            if resolved in before_files:
                 continue
 
-            if before_artifacts is not None:
-                if before_artifacts.get(resolved) == fingerprint:
-                    continue
-            elif before_files is not None and resolved in before_files:
+            if path.suffix.lower() not in suffixes:
                 continue
 
-            candidates.append((resolved, fingerprint))
+            if name_tokens and not any(token in path.name.lower() for token in name_tokens):
+                continue
+
+            candidates.append(resolved)
 
     if not candidates:
         return None
 
-    return sorted(candidates, key=lambda item: item[1][0], reverse=True)[0][0]
+    return sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)[0]
 
 
 def copy_artifact_to_out_dir(
@@ -699,45 +646,24 @@ def calibration_input_for_vector_beads(input_path: Path, out_dir: Path, profile:
     """
     LiteLoc beads_psf_calibrate writes the .mat next to beads_file_name.
 
-    To avoid writing beside the original lab dataset, stage the input inside the
-    run output folder and point LiteLoc to that staged path. Prefer a symlink,
-    then a hardlink, then an optional copy. The returned path intentionally does
-    not resolve symlinks because LiteLoc derives its output .mat path from this
-    string.
+    To avoid writing beside the original lab dataset, we create a symlink inside
+    the run output folder by default and point the runtime YAML to that symlink.
+    If symlink creation fails, we fall back to the original input path.
     """
     use_symlink = as_bool(get_nested(profile, "calibration", "use_input_symlink", default=True), default=True)
 
     if not use_symlink:
         return input_path
 
-    out_dir.mkdir(parents=True, exist_ok=True)
     link_path = out_dir / input_path.name
-    staged_path = absolute_path(link_path)
-
     if link_path.exists() or link_path.is_symlink():
-        return staged_path
+        return link_path.resolve()
 
     try:
         link_path.symlink_to(input_path)
-        return staged_path
+        return link_path.resolve()
     except Exception:
-        pass
-
-    try:
-        os.link(input_path, link_path)
-        return staged_path
-    except Exception:
-        pass
-
-    copy_on_failure = as_bool(
-        get_nested(profile, "calibration", "copy_input_on_symlink_failure", default=True),
-        default=True,
-    )
-    if copy_on_failure:
-        shutil.copy2(input_path, link_path)
-        return staged_path
-
-    return input_path
+        return input_path
 
 
 def build_runtime_calibration_yaml(
@@ -863,7 +789,7 @@ def run_vector_bead_calibration(
     env["LITELOC_CALIBRATION_OUTPUT"] = str(out_dir)
     env["LITELOC_RUN_OUTPUT"] = str(out_dir)
 
-    beads_file = absolute_path(Path(str(calib_config["beads_file_name"])))
+    beads_file = Path(str(calib_config["beads_file_name"])).expanduser().resolve()
     search_dirs = [
         out_dir,
         beads_file.parent,
@@ -872,18 +798,9 @@ def run_vector_bead_calibration(
         runtime.repo_dir / "results",
     ]
 
-    artifact_suffixes = {".mat"}
-    artifact_name_tokens = ("calib", "calibration", "psf", "spline")
-
-    before_artifacts: Dict[Path, Tuple[int, int]] = {}
+    before_files = set()
     for folder in search_dirs:
-        before_artifacts.update(
-            snapshot_artifacts(
-                folder,
-                suffixes=artifact_suffixes,
-                name_tokens=artifact_name_tokens,
-            )
-        )
+        before_files |= snapshot_files(folder)
 
     with log_path.open("w", encoding="utf-8") as log:
         log.write("LiteLoc vector-bead calibration adapter reached.\n")
@@ -894,8 +811,6 @@ def run_vector_bead_calibration(
         log.write(f"Input path: {input_path}\n")
         log.write(f"Runtime YAML: {runtime_yaml_path}\n")
         log.write(f"Runtime beads_file_name: {beads_file}\n")
-        if beads_file.is_symlink():
-            log.write(f"Runtime beads_file_target: {beads_file.resolve()}\n")
         log.write(f"Output dir: {out_dir}\n")
         log.write(f"PYTHONPATH: {env.get('PYTHONPATH', '')}\n")
         log.write("=" * 80 + "\n\n")
@@ -912,9 +827,9 @@ def run_vector_bead_calibration(
 
     artifact = find_new_artifact(
         search_dirs=search_dirs,
-        suffixes=artifact_suffixes,
-        before_artifacts=before_artifacts,
-        name_tokens=artifact_name_tokens,
+        before_files=before_files,
+        suffixes={".mat"},
+        name_tokens=("calib", "calibration", "psf", "spline"),
     )
     copied_artifact = copy_artifact_to_out_dir(artifact, out_dir)
 
@@ -934,11 +849,8 @@ def run_vector_bead_calibration(
         "vector_calibration_module": str(module_path),
         "vector_calibration_function": function_name,
         "runtime_calibration_yaml": str(runtime_yaml_path),
-        "runtime_beads_file_name": str(beads_file),
-        "runtime_beads_file_target": str(beads_file.resolve()) if beads_file.is_symlink() else "",
         "calibration_file": copied_artifact,
         "raw_detected_calibration_file": str(artifact) if artifact else "",
-        "artifact_detection": "new_or_modified_mat",
         "log_path": str(log_path),
         "status_json": str(status_path),
         "message": (

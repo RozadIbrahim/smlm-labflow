@@ -62,47 +62,7 @@ The user-facing interface is intentionally small:
 python run_pipeline.py calibrate -i INPUT -p PROFILE -o RUN_FOLDER -b BACKEND
 python run_pipeline.py train     -i INPUT -p PROFILE -o RUN_FOLDER -b BACKEND
 python run_pipeline.py infer     -i INPUT -p PROFILE -o RUN_FOLDER -b BACKEND
-```
-
-`INPUT` can be a single file or, where noted, a parent folder:
-
-* `infer` searches parent folders recursively and runs one inference batch per
-  discovered TIFF/OME-TIFF
-* `train` runs one training job for one training input; a folder is treated as
-  one dataset/context, not expanded into separate jobs
-* `calibrate` runs one calibration job for one PSF/profile condition; if a
-  folder contains multiple candidate TIFF/.mat/.h5 files, it refuses to guess
-
-For calibration, point `-i` to the exact bead stack or calibration artifact you
-want to use:
-
-```bash
-python run_pipeline.py calibrate -i BEAD_STACK.ome.tif -p PROFILE -o RUN_FOLDER
-python run_pipeline.py calibrate -i PSF_MODEL.h5       -p PROFILE -o RUN_FOLDER
-```
-
-If a bead dataset contains multiple independent bead stacks for the same
-profile condition, use candidate mode:
-
-```bash
-python run_pipeline.py calibrate \
-  -i BEAD_STACK_PARENT \
-  -p PROFILE \
-  -o RUN_FOLDER \
-  --multi-files
-```
-
-Candidate mode runs calibration once per discovered bead stack/artifact and
-writes a manifest for comparison. It deliberately does **not** update
-`latest_calibration.json`; choose the final calibration before training.
-
-For vector-bead calibration, LabFlow stages each bead TIFF inside the run output
-folder before calling LiteLoc. It uses a symlink first, then hardlink/copy
-fallback if needed, so LiteLoc's generated `_calib_results.mat` is captured in
-the run instead of being left beside the source dataset.
-
-Use `--max-files N` with inference or `calibrate --multi-files` for a quick
-recursive smoke test.
+````
 
 For now, the main backend is:
 
@@ -120,7 +80,7 @@ python run_pipeline.py infer \
   -b liteloc
 ```
 
-Quick test on one discovered input:
+Quick test on one movie:
 
 ```bash
 python run_pipeline.py infer \
@@ -375,17 +335,6 @@ Typical inference outputs:
 
 ```text
 results/
-  runtime_liteloc_calibration.yaml    # calibrate
-  liteloc_calibration_adapter_status.json
-  calibration_candidates_manifest.csv # calibrate --multi-files
-  calibration_candidates/
-    <candidate_id>/
-      <bead_stack>.ome.tif               # staged symlink/hardlink/copy
-      *_calib_results.mat
-      runtime_liteloc_calibration.yaml
-      liteloc_calibration_adapter_status.json
-  runtime_liteloc_train.yaml          # train
-  liteloc_training_adapter_status.json
   batches/
     <movie_id>/
       input_qc.json

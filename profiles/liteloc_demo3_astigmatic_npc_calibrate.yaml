@@ -27,7 +27,6 @@ calibration:
   enabled: true
   mode: vector_beads
   use_input_symlink: true
-  copy_input_on_symlink_failure: true
   z_step_nm: 35
 
 training:

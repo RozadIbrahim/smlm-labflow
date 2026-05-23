@@ -83,11 +83,6 @@ TIFF_EXTENSIONS = (
     ".ome.tif",
     ".ome.tiff",
 )
-CALIBRATION_FILE_EXTENSIONS = (
-    ".mat",
-    ".h5",
-    ".hdf5",
-)
 
 VALID_STEPS = {"calibrate", "train", "infer"}
 DEFAULT_BACKEND = "liteloc"
@@ -111,15 +106,10 @@ def is_tiff(path: Path) -> bool:
     return path.is_file() and name.endswith(TIFF_EXTENSIONS)
 
 
-def is_calibration_file(path: Path) -> bool:
-    name = path.name.lower()
-    return path.is_file() and name.endswith(CALIBRATION_FILE_EXTENSIONS)
-
-
 def safe_stem(path: Path) -> str:
     name = path.name
 
-    for ext in [".ome.tiff", ".ome.tif", ".tiff", ".tif", ".hdf5", ".h5", ".mat"]:
+    for ext in [".ome.tiff", ".ome.tif", ".tiff", ".tif"]:
         if name.lower().endswith(ext):
             name = name[: -len(ext)]
             break
@@ -240,201 +230,6 @@ def discover_tiff_movies(
         movies = movies[:max_files]
 
     return movies
-
-
-def calibration_mode_from_config(
-    profile: Mapping[str, Any],
-    backend_config: Mapping[str, Any],
-) -> str:
-    return str(
-        backend_config.get("calibration_mode")
-        or get_nested(profile, ["calibration", "mode"], "auto")
-        or "auto"
-    ).strip().lower().replace("-", "_")
-
-
-def find_calibration_candidates(
-    input_path: Path,
-    profile: Mapping[str, Any],
-    backend_config: Mapping[str, Any],
-) -> Tuple[List[Path], str]:
-    input_path = input_path.expanduser().resolve()
-    mode = calibration_mode_from_config(profile, backend_config)
-
-    if mode in {"none", "analytic"}:
-        return [input_path], "profile-defined calibration"
-
-    if input_path.is_file():
-        if mode == "vector_beads" and not is_tiff(input_path):
-            raise ValueError(
-                f"vector_beads calibration expects one TIFF/OME-TIFF bead stack: {input_path}"
-            )
-        if mode == "spline_file" and not is_calibration_file(input_path):
-            raise ValueError(
-                f"spline_file calibration expects one .mat/.h5/.hdf5 artifact: {input_path}"
-            )
-        if mode in {"auto", ""} and not (
-            is_tiff(input_path) or is_calibration_file(input_path)
-        ):
-            raise ValueError(
-                f"Calibration input file must be TIFF/OME-TIFF, .mat, .h5, or .hdf5: {input_path}"
-            )
-        label = (
-            ".mat/.h5/.hdf5 calibration artifact"
-            if is_calibration_file(input_path)
-            else "TIFF/OME-TIFF bead stack"
-        )
-        return [input_path], label
-
-    if not input_path.is_dir():
-        raise FileNotFoundError(f"Input path does not exist: {input_path}")
-
-    if mode == "spline_file":
-        candidates = [
-            p.resolve() for p in input_path.rglob("*") if is_calibration_file(p)
-        ]
-        label = ".mat/.h5/.hdf5 calibration artifact"
-    elif mode in {"auto", ""}:
-        candidates = [p.resolve() for p in input_path.rglob("*") if is_tiff(p)]
-        label = "TIFF/OME-TIFF bead stack"
-        if not candidates:
-            candidates = [
-                p.resolve() for p in input_path.rglob("*") if is_calibration_file(p)
-            ]
-            label = ".mat/.h5/.hdf5 calibration artifact"
-    else:
-        candidates = [p.resolve() for p in input_path.rglob("*") if is_tiff(p)]
-        label = "TIFF/OME-TIFF bead stack"
-
-    return sorted(candidates, key=lambda p: str(p).lower()), label
-
-
-def resolve_single_calibration_input(
-    input_path: Path,
-    profile: Mapping[str, Any],
-    backend_config: Mapping[str, Any],
-) -> Path:
-    """
-    Resolve exactly one calibration input.
-
-    Vector-bead calibration consumes TIFF stacks. Spline-file calibration
-    consumes existing .mat/.h5/.hdf5 calibration artifacts. Analytic/no-external
-    calibration keeps the user-provided path as a single bookkeeping input.
-    """
-    candidates, label = find_calibration_candidates(
-        input_path=input_path,
-        profile=profile,
-        backend_config=backend_config,
-    )
-
-    if len(candidates) == 1:
-        return candidates[0]
-
-    if not candidates:
-        raise ValueError(
-            f"No {label} found for calibration under: {input_path}"
-        )
-
-    preview = "\n".join(f"  - {path}" for path in candidates[:10])
-    more = "" if len(candidates) <= 10 else f"\n  ... {len(candidates) - 10} more"
-    raise RuntimeError(
-        "Calibration needs exactly one input for one PSF/profile condition. "
-        f"Found {len(candidates)} candidate {label} files under {input_path}:\n"
-        f"{preview}{more}\n"
-        "Point -i to the single bead stack or calibration artifact you want to use."
-    )
-
-
-def discover_multi_calibration_inputs(
-    input_path: Path,
-    profile: Mapping[str, Any],
-    backend_config: Mapping[str, Any],
-    max_files: Optional[int] = None,
-) -> Tuple[List[Path], str]:
-    """
-    Resolve calibration candidates for explicit multi-file calibration mode.
-
-    This mode is for comparing independent candidate bead stacks/artifacts for
-    the same profile condition. It never selects the final calibration itself.
-    """
-    mode = calibration_mode_from_config(profile, backend_config)
-    if mode in {"none", "analytic"}:
-        raise RuntimeError("--multi-files is not meaningful for none/analytic calibration modes.")
-
-    candidates, label = find_calibration_candidates(
-        input_path=input_path,
-        profile=profile,
-        backend_config=backend_config,
-    )
-    if max_files is not None:
-        candidates = candidates[:max_files]
-
-    if not candidates:
-        raise RuntimeError(f"No {label} files found for --multi-files under: {input_path}")
-
-    return candidates, label
-
-
-def resolve_single_training_input(
-    input_path: Path,
-) -> Path:
-    """
-    Resolve exactly one training input.
-
-    A file must be TIFF/OME-TIFF. A folder is treated as one training dataset
-    and is passed to the backend as one job; it is not expanded into per-file
-    training jobs.
-    """
-    input_path = input_path.expanduser().resolve()
-    if input_path.is_file():
-        if not is_tiff(input_path):
-            raise ValueError(f"Training input file is not TIFF/OME-TIFF: {input_path}")
-        return input_path
-
-    if not input_path.is_dir():
-        raise FileNotFoundError(f"Input path does not exist: {input_path}")
-
-    movies = discover_tiff_movies(input_path)
-    if not movies:
-        raise RuntimeError(f"No TIFF/OME-TIFF files found under training folder: {input_path}")
-    return input_path
-
-
-def output_dir_for_item(
-    *,
-    root_results_dir: Path,
-    collection_name: str,
-    item_path: Path,
-    index: int,
-    total: int,
-) -> Path:
-    if total == 1:
-        return root_results_dir / collection_name / make_batch_id(item_path, index)
-    return root_results_dir / collection_name / make_batch_id(item_path, index)
-
-
-def summarize_batch_status(
-    rows: Sequence[Mapping[str, Any]],
-    status_key: str,
-) -> Tuple[str, int, int]:
-    passed = sum(str(row.get(status_key, "")).lower() == "passed" for row in rows)
-    failed = len(rows) - passed
-    if passed == len(rows):
-        status = "passed"
-    elif passed > 0:
-        status = "warning"
-    else:
-        status = "failed"
-    return status, passed, failed
-
-
-def max_files_arg(args: argparse.Namespace) -> Optional[int]:
-    value = getattr(args, "max_files", None)
-    if value is None:
-        return None
-    if value < 1:
-        raise ValueError("--max-files must be >= 1")
-    return int(value)
 
 
 # =============================================================================
@@ -1435,7 +1230,6 @@ def write_artifact_snapshot(
     backend_config: Mapping[str, Any],
     step_result: Mapping[str, Any],
     status: str,
-    promote_latest: bool = True,
 ) -> Dict[str, Any]:
     profile_path = str(profile.get("profile_path", ""))
     profile_label = profile_name(profile, Path(profile_path or "profile.yaml"))
@@ -1464,8 +1258,6 @@ def write_artifact_snapshot(
 
     if step == "calibrate":
         artifact["calibration_file"] = step_result.get("calibration_file", "")
-        if step_result.get("calibration_files"):
-            artifact["calibration_files"] = step_result.get("calibration_files", [])
     elif step == "train":
         artifact["model_path"] = step_result.get("model_path", "")
         artifact["used_calibration"] = backend_config.get("calibration_file", "")
@@ -1496,16 +1288,11 @@ def write_artifact_snapshot(
     registry["updated_at"] = now_iso()
     write_json(registry, global_artifacts_path)
 
-    if (
-        promote_latest
-        and step == "calibrate"
-        and status == "passed"
-        and artifact.get("calibration_file")
-    ):
+    if step == "calibrate" and status == "passed" and artifact.get("calibration_file"):
         write_json(artifact, global_dir / "latest_calibration.json")
-    elif promote_latest and step == "train" and status == "passed" and artifact.get("model_path"):
+    elif step == "train" and status == "passed" and artifact.get("model_path"):
         write_json(artifact, global_dir / "latest_model.json")
-    elif promote_latest and step == "infer" and status in {"passed", "warning"}:
+    elif step == "infer" and status in {"passed", "warning"}:
         write_json(artifact, global_dir / "latest_results.json")
 
     return artifact
@@ -1571,7 +1358,7 @@ def print_header(
     folders: RunFolders,
     backend_name: str,
     backend_config: Mapping[str, Any],
-    n_inputs: Optional[int] = None,
+    n_movies: Optional[int] = None,
 ) -> None:
     print("=" * 70)
     print(f"SMLM LabFlow pipeline — {step}")
@@ -1591,8 +1378,8 @@ def print_header(
     print(f"Calibration:  {display_path(backend_config.get('calibration_file', ''))}")
     print(f"Model:        {display_path(backend_config.get('model_path', ''))}")
     print(f"Device:       {backend_config.get('device', '')}")
-    if n_inputs is not None:
-        print(f"Inputs:       {n_inputs}")
+    if n_movies is not None:
+        print(f"Movies:       {n_movies}")
     print("=" * 70)
     print()
 
@@ -1615,9 +1402,7 @@ def dry_run_result(
         "run_folder": folders.as_dict(),
         "resolved_backend_config": dict(backend_config),
         "profile_name": profile.get("profile_name", ""),
-        "n_inputs_detected": len(movies) if movies is not None else None,
         "n_movies_detected": len(movies) if movies is not None else None,
-        "inputs": [str(movie) for movie in movies] if movies is not None else [],
         "movies": [str(movie) for movie in movies] if movies is not None else [],
     }
     print_header(
@@ -1627,7 +1412,7 @@ def dry_run_result(
         folders=folders,
         backend_name=backend_name,
         backend_config=backend_config,
-        n_inputs=len(movies) if movies is not None else None,
+        n_movies=len(movies) if movies is not None else None,
     )
     print("Dry run enabled. Nothing was executed.")
     print("Planned parent run folder:")
@@ -1636,281 +1421,32 @@ def dry_run_result(
     return result
 
 
-def run_multi_file_calibrate(
-    *,
-    args: argparse.Namespace,
-    profile: Dict[str, Any],
-    backend_name: str,
-    folders: RunFolders,
-    backend_config: Dict[str, Any],
-    input_path: Path,
-    profile_path: Path,
-) -> Dict[str, Any]:
-    calibration_inputs, candidate_label = discover_multi_calibration_inputs(
-        input_path=input_path,
-        profile=profile,
-        backend_config=backend_config,
-        max_files=max_files_arg(args),
-    )
-
-    if args.dry_run:
-        return dry_run_result(
-            args,
-            profile,
-            backend_name,
-            folders,
-            backend_config,
-            movies=calibration_inputs,
-        )
-
-    print_header(
-        "calibrate",
-        input_path,
-        profile_path,
-        folders,
-        backend_name,
-        backend_config,
-        n_inputs=len(calibration_inputs),
-    )
-    write_run_status(
-        folders,
-        status="running",
-        message="Multi-file calibration candidate run started.",
-        extra={
-            "multi_files": True,
-            "promotes_latest_calibration": False,
-        },
-    )
-
-    bench = RuntimeBenchmark(out_dir=folders.benchmarks)
-    rows: List[Dict[str, Any]] = []
-    total_inputs = len(calibration_inputs)
-
-    for index, calibration_input in enumerate(calibration_inputs, start=1):
-        candidate_id = make_batch_id(calibration_input, index)
-        candidate_out_dir = output_dir_for_item(
-            root_results_dir=folders.results,
-            collection_name="calibration_candidates",
-            item_path=calibration_input,
-            index=index,
-            total=total_inputs,
-        )
-        candidate_out_dir.mkdir(parents=True, exist_ok=True)
-
-        print(f"[{index}/{total_inputs}] {calibration_input.name}")
-        if is_tiff(calibration_input):
-            bench.benchmark_input_movie(calibration_input, batch_index=index)
-
-        with bench.stage(
-            "backend_calibrate_candidate",
-            batch_index=index,
-            input_path=calibration_input,
-            out_dir=candidate_out_dir,
-        ):
-            candidate_result = run_backend_step(
-                step="calibrate",
-                backend_name=backend_name,
-                input_path=calibration_input,
-                out_dir=candidate_out_dir,
-                profile=profile,
-                backend_config=backend_config,
-                batch_index=index,
-            )
-
-        candidate_quality = run_quality_metrics_safely(
-            step="calibrate",
-            bench=bench,
-            folders=folders,
-            profile=profile,
-            batch_index=index,
-            reports_subdir=f"calibration_candidate_{index:03d}_{safe_stem(calibration_input)}",
-            paths={
-                "run_dir": candidate_out_dir,
-                "calibration_file": candidate_result.get("calibration_file", ""),
-            },
-        )
-
-        row: Dict[str, Any] = {
-            "candidate_index": index,
-            "candidate_id": candidate_id,
-            "input_path": str(calibration_input),
-            "input_name": calibration_input.name,
-            "input_parent": str(calibration_input.parent),
-            "candidate_dir": str(candidate_out_dir),
-            "profile_path": str(profile_path),
-            "backend_name": backend_name,
-            "candidate_label": candidate_label,
-            "selected_for_training": False,
-            "promoted_to_latest_calibration": False,
-            "quality_metrics_status": candidate_quality.get("status", ""),
-            "quality_metrics_result": candidate_quality,
-            "created_at": now_iso(),
-        }
-        row.update(candidate_result)
-        rows.append(row)
-        print(f"    Calibration candidate: {candidate_result.get('calibrate_status')}")
-
-    manifest_csv = folders.results / "calibration_candidates_manifest.csv"
-    manifest_json = folders.results / "calibration_candidates_manifest.json"
-    write_manifest_csv(rows, manifest_csv)
-    write_json(rows, manifest_json)
-
-    calibration_files = [
-        str(row.get("calibration_file", ""))
-        for row in rows
-        if str(row.get("calibration_file", "")).strip()
-        and row.get("calibrate_status") == "passed"
-    ]
-    backend_status, passed_count, failed_count = summarize_batch_status(
-        rows,
-        "calibrate_status",
-    )
-    backend_result = {
-        "backend_name": backend_name,
-        "backend_status": backend_status,
-        "calibrate_status": backend_status,
-        "input_path": str(input_path),
-        "multi_files": True,
-        "promotes_latest_calibration": False,
-        "candidate_label": candidate_label,
-        "n_inputs": total_inputs,
-        "n_passed": passed_count,
-        "n_failed": failed_count,
-        "calibration_file": "",
-        "selected_calibration_file": "",
-        "calibration_files": calibration_files,
-        "candidate_manifest_csv": str(manifest_csv),
-        "candidate_manifest_json": str(manifest_json),
-        "candidate_results": rows,
-        "message": (
-            "Calibration candidates completed. No candidate was promoted to latest_calibration."
-            if backend_status == "passed"
-            else "Calibration candidates completed with failures. No candidate was promoted to latest_calibration."
-        ),
-    }
-
-    benchmark_summary = bench.finalize()
-    status = str(backend_result.get("calibrate_status") or "failed")
-
-    artifact = write_artifact_snapshot(
-        step="calibrate",
-        folders=folders,
-        profile=profile,
-        backend_name=backend_name,
-        backend_config=backend_config,
-        step_result=backend_result,
-        status=status,
-        promote_latest=False,
-    )
-
-    summary = {
-        "created_at": now_iso(),
-        "step": "calibrate",
-        "status": status,
-        "input": str(input_path),
-        "profile_path": str(profile_path),
-        "backend_name": backend_name,
-        "run_parent": str(folders.parent),
-        "results_dir": str(folders.results),
-        "benchmarks_dir": str(folders.benchmarks),
-        "reports_dir": str(folders.reports),
-        "registry_dir": str(folders.registry),
-        "multi_files": True,
-        "promotes_latest_calibration": False,
-        "candidate_label": candidate_label,
-        "n_inputs": total_inputs,
-        "n_passed": passed_count,
-        "n_failed": failed_count,
-        "n_input_movies": sum(is_tiff(path) for path in calibration_inputs),
-        "calibration_files": calibration_files,
-        "candidate_manifest_csv": str(manifest_csv),
-        "candidate_manifest_json": str(manifest_json),
-        "backend_result": backend_result,
-        "quality_metrics": {
-            "status": "per_candidate",
-            "message": "Quality metrics were run per calibration candidate where available.",
-        },
-        "benchmark": benchmark_summary,
-        "artifact": artifact,
-    }
-    write_json(summary, folders.results / "calibration_summary.json")
-    write_json(summary, folders.registry / "run_summary.json")
-
-    report = generate_report_safely(folders)
-    summary["report"] = report
-    write_json(summary, folders.results / "calibration_summary.json")
-    write_json(summary, folders.registry / "run_summary.json")
-    write_run_status(
-        folders,
-        status=status,
-        message=(
-            "Multi-file calibration candidate run completed. "
-            "latest_calibration.json was not updated."
-        ),
-        extra={
-            "artifact_id": artifact.get("id"),
-            "promotes_latest_calibration": False,
-        },
-    )
-
-    print_footer(folders, summary)
-    return summary
-
-
 def run_calibrate(args: argparse.Namespace) -> Dict[str, Any]:
     profile, backend_name, folders, backend_config = prepare_run_context(args)
     input_path = Path(args.i).expanduser().resolve()
     profile_path = Path(args.p).expanduser().resolve()
 
-    if getattr(args, "multi_files", False):
-        return run_multi_file_calibrate(
-            args=args,
-            profile=profile,
-            backend_name=backend_name,
-            folders=folders,
-            backend_config=backend_config,
-            input_path=input_path,
-            profile_path=profile_path,
-        )
-
-    calibration_input = resolve_single_calibration_input(
-        input_path,
-        profile=profile,
-        backend_config=backend_config,
-    )
-
     if args.dry_run:
-        return dry_run_result(
-            args,
-            profile,
-            backend_name,
-            folders,
-            backend_config,
-            movies=[calibration_input],
-        )
+        return dry_run_result(args, profile, backend_name, folders, backend_config)
 
     print_header(
-        "calibrate",
-        input_path,
-        profile_path,
-        folders,
-        backend_name,
-        backend_config,
-        n_inputs=1,
+        "calibrate", input_path, profile_path, folders, backend_name, backend_config
     )
     write_run_status(folders, status="running", message="Calibration started.")
 
     bench = RuntimeBenchmark(out_dir=folders.benchmarks)
-    if is_tiff(calibration_input):
-        bench.benchmark_input_movie(calibration_input, batch_index=1)
+
+    movies = discover_tiff_movies(input_path)
+    for index, movie_path in enumerate(movies, start=1):
+        bench.benchmark_input_movie(movie_path, batch_index=index)
 
     with bench.stage(
-        "backend_calibrate", input_path=calibration_input, out_dir=folders.results
+        "backend_calibrate", input_path=input_path, out_dir=folders.results
     ):
         backend_result = run_backend_step(
             step="calibrate",
             backend_name=backend_name,
-            input_path=calibration_input,
+            input_path=input_path,
             out_dir=folders.results,
             profile=profile,
             backend_config=backend_config,
@@ -1961,11 +1497,7 @@ def run_calibrate(args: argparse.Namespace) -> Dict[str, Any]:
         "benchmarks_dir": str(folders.benchmarks),
         "reports_dir": str(folders.reports),
         "registry_dir": str(folders.registry),
-        "multi_files": False,
-        "promotes_latest_calibration": True,
-        "calibration_input": str(calibration_input),
-        "n_inputs": 1,
-        "n_input_movies": 1 if is_tiff(calibration_input) else 0,
+        "n_input_movies": len(movies),
         "backend_result": backend_result,
         "quality_metrics": quality_result,
         "benchmark": benchmark_summary,
@@ -1992,43 +1524,26 @@ def run_train(args: argparse.Namespace) -> Dict[str, Any]:
     profile, backend_name, folders, backend_config = prepare_run_context(args)
     input_path = Path(args.i).expanduser().resolve()
     profile_path = Path(args.p).expanduser().resolve()
-    training_input = resolve_single_training_input(input_path)
-    input_movies = (
-        [training_input]
-        if is_tiff(training_input)
-        else discover_tiff_movies(training_input, max_files=max_files_arg(args))
-    )
 
     if args.dry_run:
-        return dry_run_result(
-            args,
-            profile,
-            backend_name,
-            folders,
-            backend_config,
-            movies=[training_input],
-        )
+        return dry_run_result(args, profile, backend_name, folders, backend_config)
 
     print_header(
-        "train",
-        input_path,
-        profile_path,
-        folders,
-        backend_name,
-        backend_config,
-        n_inputs=1,
+        "train", input_path, profile_path, folders, backend_name, backend_config
     )
     write_run_status(folders, status="running", message="Training started.")
 
     bench = RuntimeBenchmark(out_dir=folders.benchmarks)
-    for index, movie_path in enumerate(input_movies, start=1):
+
+    movies = discover_tiff_movies(input_path)
+    for index, movie_path in enumerate(movies, start=1):
         bench.benchmark_input_movie(movie_path, batch_index=index)
 
-    with bench.stage("backend_train", input_path=training_input, out_dir=folders.results):
+    with bench.stage("backend_train", input_path=input_path, out_dir=folders.results):
         backend_result = run_backend_step(
             step="train",
             backend_name=backend_name,
-            input_path=training_input,
+            input_path=input_path,
             out_dir=folders.results,
             profile=profile,
             backend_config=backend_config,
@@ -2080,9 +1595,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, Any]:
         "benchmarks_dir": str(folders.benchmarks),
         "reports_dir": str(folders.reports),
         "registry_dir": str(folders.registry),
-        "training_input": str(training_input),
-        "n_inputs": 1,
-        "n_input_movies": len(input_movies),
+        "n_input_movies": len(movies),
         "backend_result": backend_result,
         "quality_metrics": quality_result,
         "benchmark": benchmark_summary,
@@ -2110,18 +1623,13 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
     input_path = Path(args.i).expanduser().resolve()
     profile_path = Path(args.p).expanduser().resolve()
 
-    movies = discover_tiff_movies(input_path, max_files=max_files_arg(args))
+    movies = discover_tiff_movies(input_path, max_files=args.max_files)
     if not movies:
         raise RuntimeError(f"No TIFF/OME-TIFF files found in: {input_path}")
 
     if args.dry_run:
         return dry_run_result(
-            args,
-            profile,
-            backend_name,
-            folders,
-            backend_config,
-            movies=movies,
+            args, profile, backend_name, folders, backend_config, movies=movies
         )
 
     print_header(
@@ -2131,7 +1639,7 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
         folders,
         backend_name,
         backend_config,
-        n_inputs=len(movies),
+        n_movies=len(movies),
     )
     write_run_status(folders, status="running", message="Inference started.")
 
@@ -2509,7 +2017,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "-i",
         required=True,
-        help="Input file or folder. Calibrate/train use one input; infer recurses over TIFF/OME-TIFF files.",
+        help="Input TIFF/OME-TIFF file or folder.",
     )
     parser.add_argument(
         "-p",
@@ -2571,21 +2079,6 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     add_common_args(calibrate_parser)
-    calibrate_parser.add_argument(
-        "--multi-files",
-        action="store_true",
-        help=(
-            "Optional candidate mode: recursively run calibration once per "
-            "discovered bead stack/artifact and write a candidate manifest. "
-            "Does not update latest_calibration.json."
-        ),
-    )
-    calibrate_parser.add_argument(
-        "--max-files",
-        type=int,
-        default=None,
-        help="Optional quick test limit for --multi-files calibration candidates.",
-    )
 
     train_parser = subparsers.add_parser(
         "train",
@@ -2604,7 +2097,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-files",
         type=int,
         default=None,
-        help="Optional quick test limit for recursive inference/movie discovery.",
+        help="Optional quick test limit for inference.",
     )
 
     return parser
