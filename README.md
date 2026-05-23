@@ -100,14 +100,15 @@ smlm-labflow/
 │
 ├── run_pipeline.py              # Main CLI: calibrate / train / infer
 ├── run_folders.py               # Run folder creation and organization
-├── benchmark.py                 # Runtime/resource benchmarking
+├── benchmark.py                 # Runtime/resource/scientific benchmarking
 ├── qc_input.py                  # Raw input movie QC
 ├── schema.py                    # Canonical localization schema
 ├── post_inference.py            # Raw backend output → canonical output
 ├── export_downstream.py         # SMAP / Picasso / napari / Locan exports
 ├── combine_run_outputs.py       # Combine batch outputs
+├── combine_benchmark_comparisons.py # Combine comparison rows across runs
 ├── generate_run_report.py       # Markdown/HTML run reports
-├── quality_metrics.py           # Optional scientific QC metrics
+├── quality_metrics.py           # Automatic scientific QC metrics
 ├── napari_locan_review.py       # Separate manual review helper
 │
 ├── adapters/
@@ -135,8 +136,8 @@ The project separates machine configuration, scientific configuration, backend e
 | `adapters/*_adapter.py`      | Backend-specific calibrate/train/infer execution |
 | `qc_input.py`                | Raw input QC                                     |
 | `post_inference.py`          | Canonicalization and export coordination         |
-| `quality_metrics.py`         | Optional scientific QC metrics                   |
-| `benchmark.py`               | Timing/resource monitoring only                  |
+| `quality_metrics.py`         | Automatic scientific QC metrics                  |
+| `benchmark.py`               | Runtime/resources plus comparison-grade metrics  |
 | `generate_run_report.py`     | Human-readable reports                           |
 
 Important rule:
@@ -146,7 +147,7 @@ backend_paths.yml = where software is installed
 profiles/*.yaml  = what scientific workflow to run
 resolver.py      = connects paths + profile + registry
 adapter.py       = executes backend steps only
-benchmark.py     = measures runtime/resources only
+benchmark.py     = measures runtime/resources and comparison metrics
 ```
 
 ---
@@ -348,6 +349,14 @@ results/
 
 benchmarks/
   runtime_benchmark.csv
+  resource_benchmark.csv
+  machine_specs.json
+  machine_specs.csv
+  localization_qc_benchmark.csv
+  resolution_benchmark.csv
+  drift_benchmark.csv
+  quality_metrics_benchmark.csv
+  comparison_ready_summary.csv
   benchmark_summary.json
 
 reports/
@@ -386,6 +395,13 @@ python -m py_compile adapters/liteloc_adapter.py
 python -m py_compile qc_input.py
 python -m py_compile post_inference.py
 python -m py_compile benchmark.py
+python -m py_compile combine_benchmark_comparisons.py
+```
+
+Combine many runs into one comparison table:
+
+```bash
+python combine_benchmark_comparisons.py results -o comparison_summary_all_runs.csv
 ```
 
 Optional:

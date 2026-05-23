@@ -998,6 +998,153 @@ def build_export_validation_map(
     return exports
 
 
+def run_quality_metrics_safely(
+    *,
+    step: str,
+    bench: RuntimeBenchmark,
+    folders: RunFolders,
+    profile: Mapping[str, Any],
+    paths: Mapping[str, Any],
+    batch_index: Optional[int] = None,
+    reports_subdir: Optional[str] = None,
+) -> Dict[str, Any]:
+    try:
+        from quality_metrics import run_quality
+    except Exception as exc:
+        payload = {
+            "step": step,
+            "status": "not_available",
+            "flags": [
+                {
+                    "severity": "warning",
+                    "code": "quality_metrics_import_failed",
+                    "message": repr(exc),
+                }
+            ],
+            "output_paths": {},
+        }
+        bench.add_quality_metrics_result(step, payload, batch_index=batch_index)
+        return payload
+
+    out_dir = folders.reports
+    quality_benchmarks_dir = folders.benchmarks
+    if reports_subdir:
+        safe_subdir = safe_name(reports_subdir)
+        out_dir = folders.reports / safe_subdir
+        quality_benchmarks_dir = folders.benchmarks / safe_subdir
+
+    quality_paths: Dict[str, Any] = dict(paths)
+    quality_paths.setdefault("out_dir", out_dir)
+    quality_paths.setdefault("reports_dir", out_dir)
+    quality_paths.setdefault("benchmarks_dir", quality_benchmarks_dir)
+
+    try:
+        payload = run_quality(
+            step,
+            paths=quality_paths,
+            profile=profile,
+            out_dir=out_dir,
+        )
+    except Exception as exc:
+        payload = {
+            "step": step,
+            "status": "error",
+            "flags": [
+                {
+                    "severity": "error",
+                    "code": "quality_metrics_failed",
+                    "message": repr(exc),
+                }
+            ],
+            "output_paths": {},
+        }
+
+    bench.add_quality_metrics_result(step, payload, batch_index=batch_index)
+    return payload
+
+
+def resolve_optional_profile_path(value: Any, base_dir: Path) -> Optional[Path]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"auto", "none", "null", "false"}:
+        return None
+    path = Path(text).expanduser()
+    if not path.is_absolute():
+        path = base_dir / path
+    return path.resolve()
+
+
+def infer_truth_csv_for_movie(
+    profile: Mapping[str, Any],
+    movie_path: Path,
+    batch_index: int,
+) -> Optional[Path]:
+    truth_block = profile.get("truth", {})
+    benchmark_block = profile.get("benchmark", {})
+
+    candidates: List[Any] = [
+        get_nested(profile, ["truth", "csv"], None),
+        get_nested(profile, ["truth", "path"], None),
+        get_nested(profile, ["ground_truth", "csv"], None),
+        get_nested(profile, ["ground_truth", "path"], None),
+        get_nested(profile, ["benchmark", "truth_csv"], None),
+    ]
+
+    if isinstance(truth_block, Mapping):
+        by_file = truth_block.get("by_file")
+        if isinstance(by_file, Mapping):
+            candidates.insert(0, by_file.get(movie_path.name))
+            candidates.insert(0, by_file.get(movie_path.stem))
+        by_index = truth_block.get("by_index")
+        if isinstance(by_index, Mapping):
+            candidates.insert(0, by_index.get(str(batch_index)))
+            candidates.insert(0, by_index.get(batch_index))
+    if isinstance(benchmark_block, Mapping):
+        by_file = benchmark_block.get("truth_by_file")
+        if isinstance(by_file, Mapping):
+            candidates.insert(0, by_file.get(movie_path.name))
+            candidates.insert(0, by_file.get(movie_path.stem))
+
+    base_dir = project_root()
+    profile_path = profile.get("profile_path")
+    if profile_path:
+        try:
+            base_dir = Path(str(profile_path)).expanduser().resolve().parent
+        except Exception:
+            base_dir = project_root()
+
+    for candidate in candidates:
+        path = resolve_optional_profile_path(candidate, base_dir)
+        if path is not None and path.exists():
+            return path
+    return None
+
+
+def truth_match_radius_xy_nm(profile: Mapping[str, Any]) -> float:
+    value = (
+        get_nested(profile, ["truth", "match_radius_xy_nm"], None)
+        or get_nested(profile, ["benchmark", "match_radius_xy_nm"], None)
+        or 50.0
+    )
+    try:
+        return float(value)
+    except Exception:
+        return 50.0
+
+
+def truth_match_radius_z_nm(profile: Mapping[str, Any]) -> float:
+    value = (
+        get_nested(profile, ["truth", "match_radius_z_nm"], None)
+        or get_nested(profile, ["benchmark", "match_radius_z_nm"], None)
+        or 100.0
+    )
+    try:
+        return float(value)
+    except Exception:
+        return 100.0
+
+
 def combine_outputs_safely(folders: RunFolders) -> Dict[str, Any]:
     try:
         from combine_run_outputs import combine_run_outputs
@@ -1305,6 +1452,19 @@ def run_calibrate(args: argparse.Namespace) -> Dict[str, Any]:
             backend_config=backend_config,
         )
 
+    quality_result = run_quality_metrics_safely(
+        step="calibrate",
+        bench=bench,
+        folders=folders,
+        profile=profile,
+        paths={
+            "run_dir": folders.parent,
+            "calibration_file": backend_result.get("calibration_file", ""),
+            "out_dir": folders.reports,
+            "reports_dir": folders.reports,
+        },
+    )
+
     benchmark_summary = bench.finalize()
     status = (
         "passed"
@@ -1312,6 +1472,8 @@ def run_calibrate(args: argparse.Namespace) -> Dict[str, Any]:
         or backend_result.get("backend_status") == "passed"
         else "failed"
     )
+    if status == "passed" and quality_result.get("status") in {"fail", "error"}:
+        status = "warning"
 
     artifact = write_artifact_snapshot(
         step="calibrate",
@@ -1337,6 +1499,7 @@ def run_calibrate(args: argparse.Namespace) -> Dict[str, Any]:
         "registry_dir": str(folders.registry),
         "n_input_movies": len(movies),
         "backend_result": backend_result,
+        "quality_metrics": quality_result,
         "benchmark": benchmark_summary,
         "artifact": artifact,
     }
@@ -1386,6 +1549,20 @@ def run_train(args: argparse.Namespace) -> Dict[str, Any]:
             backend_config=backend_config,
         )
 
+    quality_result = run_quality_metrics_safely(
+        step="train",
+        bench=bench,
+        folders=folders,
+        profile=profile,
+        paths={
+            "run_dir": folders.parent,
+            "checkpoint": backend_result.get("model_path", ""),
+            "model_path": backend_result.get("model_path", ""),
+            "out_dir": folders.reports,
+            "reports_dir": folders.reports,
+        },
+    )
+
     benchmark_summary = bench.finalize()
     status = (
         "passed"
@@ -1393,6 +1570,8 @@ def run_train(args: argparse.Namespace) -> Dict[str, Any]:
         or backend_result.get("backend_status") == "passed"
         else "failed"
     )
+    if status == "passed" and quality_result.get("status") in {"fail", "error"}:
+        status = "warning"
 
     artifact = write_artifact_snapshot(
         step="train",
@@ -1418,6 +1597,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, Any]:
         "registry_dir": str(folders.registry),
         "n_input_movies": len(movies),
         "backend_result": backend_result,
+        "quality_metrics": quality_result,
         "benchmark": benchmark_summary,
         "artifact": artifact,
     }
@@ -1510,6 +1690,8 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
             "batch_size": backend_config.get("batch_size", ""),
             "threshold": backend_config.get("threshold", ""),
         }
+        quality_result: Dict[str, Any] = {}
+        truth_result: Dict[str, Any] = {}
 
         # ------------------------------------------------------------------
         # Input QC
@@ -1606,6 +1788,32 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
                         canonical_path, export_result
                     )
                     bench.validate_exports(export_validation_map)
+
+                    quality_result = run_quality_metrics_safely(
+                        step="infer",
+                        bench=bench,
+                        folders=folders,
+                        profile=profile,
+                        batch_index=index,
+                        reports_subdir=f"batch_{index:03d}_{safe_stem(movie_path)}",
+                        paths={
+                            "run_dir": batch_out_dir,
+                            "canonical_csv": canonical_path,
+                            "input_qc_json": qc_result.get(
+                                "qc_json", str(batch_out_dir / "input_qc.json")
+                            ),
+                        },
+                    )
+
+                    truth_csv = infer_truth_csv_for_movie(profile, movie_path, index)
+                    if truth_csv is not None:
+                        truth_result = bench.benchmark_truth(
+                            prediction_csv=canonical_path,
+                            truth_csv=truth_csv,
+                            batch_index=index,
+                            match_radius_xy_nm=truth_match_radius_xy_nm(profile),
+                            match_radius_z_nm=truth_match_radius_z_nm(profile),
+                        )
             else:
                 canonical_result = {
                     "canonical_status": "skipped_no_raw_output",
@@ -1636,6 +1844,10 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
         row["qc_full_result"] = qc_result
         row.update(backend_result)
         row.update(canonical_result)
+        row["quality_metrics_status"] = quality_result.get("status", "")
+        row["quality_metrics_result"] = quality_result
+        row["truth_benchmark_status"] = truth_result.get("status", "")
+        row["truth_benchmark_result"] = truth_result
         row["post_inference_status"] = export_result.get("status", "")
         row["downstream_export_status"] = export_result.get("status", "")
         row["downstream_export_result"] = export_result
@@ -1690,6 +1902,18 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
         "post_inference_failed": sum(
             row.get("post_inference_status") == "failed" for row in rows
         ),
+        "quality_passed": sum(
+            row.get("quality_metrics_status") == "passed" for row in rows
+        ),
+        "quality_warning": sum(
+            row.get("quality_metrics_status") == "warning" for row in rows
+        ),
+        "quality_failed": sum(
+            row.get("quality_metrics_status") in {"fail", "error"} for row in rows
+        ),
+        "truth_benchmarks": sum(
+            bool(row.get("truth_benchmark_status")) for row in rows
+        ),
         "manifest_csv": str(manifest_csv),
         "manifest_json": str(manifest_json),
         "summary_json": str(summary_json),
@@ -1704,6 +1928,7 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
         or summary["backend_failed"]
         or summary["canonical_failed"]
         or summary["post_inference_failed"]
+        or summary["quality_failed"]
     ):
         status = "warning"
     summary["status"] = status

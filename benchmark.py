@@ -22,7 +22,8 @@ But it also adds scientist-facing benchmark layers:
     7. truth_benchmark.csv + truth_matching_pairs.csv
     8. export_validation.csv
     9. benchmark_summary.json
-    10. figures/*.png when matplotlib is available
+    10. machine_specs.json/.csv
+    11. figures/*.png when matplotlib is available
 
 Design principle:
     This script must never crash the whole pipeline just because an optional
@@ -42,6 +43,8 @@ Recommended location inside one parent run folder:
     │   ├── drift_benchmark.csv
     │   ├── truth_benchmark.csv
     │   ├── export_validation.csv
+    │   ├── machine_specs.json
+    │   ├── machine_specs.csv
     │   ├── benchmark_summary.json
     │   └── figures/
     ├── reports/
@@ -52,11 +55,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib.metadata
 import json
 import math
 import os
 import platform
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -84,6 +90,15 @@ def bytes_to_mb(value: Optional[int | float]) -> Optional[float]:
         return None
 
 
+def mb_to_gb(value: Optional[int | float]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return round(float(value) / 1024.0, 3)
+    except Exception:
+        return None
+
+
 def safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
     try:
         if value is None:
@@ -103,6 +118,14 @@ def safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
         return int(value)
     except Exception:
         return default
+
+
+def safe_str(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 def safe_path(value: Optional[str | Path]) -> Optional[Path]:
@@ -304,6 +327,558 @@ def numeric_percentile(values: Sequence[float], q: float) -> Optional[float]:
         return None
 
 
+# =============================================================================
+# Machine specification capture
+# =============================================================================
+
+
+PACKAGE_VERSION_NAMES: Sequence[str] = (
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-image",
+    "tifffile",
+    "h5py",
+    "h5py-wrapper",
+    "hdfdict",
+    "omegaconf",
+    "PyYAML",
+    "psutil",
+    "natsort",
+    "thop",
+)
+
+REPRODUCIBILITY_ENV_VARS: Sequence[str] = (
+    "CUDA_VISIBLE_DEVICES",
+    "NVIDIA_VISIBLE_DEVICES",
+    "NVIDIA_DRIVER_CAPABILITIES",
+    "CONDA_DEFAULT_ENV",
+    "VIRTUAL_ENV",
+    "PYTHONPATH",
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "SLURM_JOB_ID",
+    "SLURM_JOB_NODELIST",
+    "SLURM_GPUS",
+)
+
+
+def package_version(package_name: str) -> Optional[str]:
+    try:
+        return importlib.metadata.version(package_name)
+    except Exception:
+        return None
+
+
+def read_linux_cpu_model() -> str:
+    cpuinfo = Path("/proc/cpuinfo")
+    if not cpuinfo.exists():
+        return ""
+    try:
+        for line in cpuinfo.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.lower().startswith("model name"):
+                return line.split(":", 1)[1].strip()
+    except Exception:
+        return ""
+    return ""
+
+
+def run_command_capture(args: Sequence[str], timeout_sec: float = 3.0) -> Dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            list(args),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+        return {
+            "available": completed.returncode == 0,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout.strip(),
+            "stderr": completed.stderr.strip(),
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "returncode": None,
+            "stdout": "",
+            "stderr": repr(exc),
+        }
+
+
+def collect_cpu_specs(psutil_module: Any) -> Dict[str, Any]:
+    cpu_model = (
+        read_linux_cpu_model()
+        or platform.processor()
+        or os.environ.get("PROCESSOR_IDENTIFIER", "")
+    )
+    specs: Dict[str, Any] = {
+        "model": cpu_model,
+        "architecture": platform.machine(),
+        "processor": platform.processor(),
+        "physical_cores": None,
+        "logical_cores": os.cpu_count(),
+        "frequency_current_mhz": None,
+        "frequency_min_mhz": None,
+        "frequency_max_mhz": None,
+    }
+
+    if psutil_module is not None:
+        try:
+            specs["physical_cores"] = psutil_module.cpu_count(logical=False)
+            specs["logical_cores"] = psutil_module.cpu_count(logical=True)
+        except Exception:
+            pass
+        try:
+            freq = psutil_module.cpu_freq()
+            if freq is not None:
+                specs["frequency_current_mhz"] = safe_float(getattr(freq, "current", None))
+                specs["frequency_min_mhz"] = safe_float(getattr(freq, "min", None))
+                specs["frequency_max_mhz"] = safe_float(getattr(freq, "max", None))
+        except Exception:
+            pass
+
+    return specs
+
+
+def collect_memory_specs(psutil_module: Any) -> Dict[str, Any]:
+    specs: Dict[str, Any] = {
+        "ram_total_mb": None,
+        "ram_total_gb": None,
+        "ram_available_mb": None,
+        "swap_total_mb": None,
+        "swap_total_gb": None,
+    }
+
+    if psutil_module is None:
+        return specs
+
+    try:
+        vm = psutil_module.virtual_memory()
+        ram_total_mb = bytes_to_mb(getattr(vm, "total", None))
+        specs["ram_total_mb"] = ram_total_mb
+        specs["ram_total_gb"] = mb_to_gb(ram_total_mb)
+        specs["ram_available_mb"] = bytes_to_mb(getattr(vm, "available", None))
+    except Exception:
+        pass
+
+    try:
+        swap = psutil_module.swap_memory()
+        swap_total_mb = bytes_to_mb(getattr(swap, "total", None))
+        specs["swap_total_mb"] = swap_total_mb
+        specs["swap_total_gb"] = mb_to_gb(swap_total_mb)
+    except Exception:
+        pass
+
+    return specs
+
+
+def collect_disk_specs(path: Path) -> Dict[str, Any]:
+    try:
+        usage = shutil.disk_usage(path)
+        total_mb = bytes_to_mb(usage.total)
+        free_mb = bytes_to_mb(usage.free)
+        used_mb = bytes_to_mb(usage.used)
+        return {
+            "path": str(path),
+            "total_mb": total_mb,
+            "total_gb": mb_to_gb(total_mb),
+            "used_mb": used_mb,
+            "free_mb": free_mb,
+            "free_gb": mb_to_gb(free_mb),
+        }
+    except Exception as exc:
+        return {
+            "path": str(path),
+            "error": repr(exc),
+        }
+
+
+def collect_torch_cuda_specs(torch_module: Any) -> Dict[str, Any]:
+    specs: Dict[str, Any] = {
+        "torch_available": torch_module is not None,
+        "torch_version": None,
+        "cuda_available": False,
+        "cuda_runtime_version": None,
+        "cudnn_version": None,
+        "device_count": 0,
+        "current_device": None,
+        "devices": [],
+    }
+
+    if torch_module is None:
+        return specs
+
+    try:
+        specs["torch_version"] = getattr(torch_module, "__version__", None)
+        specs["cuda_runtime_version"] = getattr(torch_module.version, "cuda", None)
+    except Exception:
+        pass
+
+    try:
+        cudnn = getattr(getattr(torch_module, "backends", None), "cudnn", None)
+        if cudnn is not None:
+            specs["cudnn_version"] = cudnn.version()
+    except Exception:
+        pass
+
+    try:
+        specs["cuda_available"] = bool(torch_module.cuda.is_available())
+    except Exception:
+        return specs
+
+    if not specs["cuda_available"]:
+        return specs
+
+    try:
+        specs["device_count"] = int(torch_module.cuda.device_count())
+    except Exception:
+        specs["device_count"] = 0
+
+    try:
+        specs["current_device"] = int(torch_module.cuda.current_device())
+    except Exception:
+        pass
+
+    devices: List[Dict[str, Any]] = []
+    for index in range(int(specs["device_count"] or 0)):
+        device: Dict[str, Any] = {"index": index}
+        try:
+            props = torch_module.cuda.get_device_properties(index)
+            total_mb = bytes_to_mb(getattr(props, "total_memory", None))
+            device.update(
+                {
+                    "name": getattr(props, "name", None),
+                    "total_memory_mb": total_mb,
+                    "total_memory_gb": mb_to_gb(total_mb),
+                    "compute_capability": (
+                        f"{getattr(props, 'major', '')}.{getattr(props, 'minor', '')}"
+                        if hasattr(props, "major") and hasattr(props, "minor")
+                        else ""
+                    ),
+                    "multi_processor_count": getattr(
+                        props, "multi_processor_count", None
+                    ),
+                }
+            )
+        except Exception as exc:
+            device["error"] = repr(exc)
+        devices.append(device)
+
+    specs["devices"] = devices
+    return specs
+
+
+def collect_nvml_specs(pynvml_module: Any) -> Dict[str, Any]:
+    specs: Dict[str, Any] = {
+        "available": pynvml_module is not None,
+        "driver_version": None,
+        "device_count": 0,
+        "devices": [],
+    }
+
+    if pynvml_module is None:
+        return specs
+
+    try:
+        specs["driver_version"] = safe_str(pynvml_module.nvmlSystemGetDriverVersion())
+    except Exception:
+        pass
+
+    try:
+        specs["device_count"] = int(pynvml_module.nvmlDeviceGetCount())
+    except Exception as exc:
+        specs["error"] = repr(exc)
+        return specs
+
+    devices: List[Dict[str, Any]] = []
+    for index in range(int(specs["device_count"] or 0)):
+        device: Dict[str, Any] = {"index": index}
+        try:
+            handle = pynvml_module.nvmlDeviceGetHandleByIndex(index)
+            mem = pynvml_module.nvmlDeviceGetMemoryInfo(handle)
+            total_mb = bytes_to_mb(getattr(mem, "total", None))
+            device.update(
+                {
+                    "name": safe_str(pynvml_module.nvmlDeviceGetName(handle)),
+                    "total_memory_mb": total_mb,
+                    "total_memory_gb": mb_to_gb(total_mb),
+                }
+            )
+            try:
+                device["uuid"] = safe_str(pynvml_module.nvmlDeviceGetUUID(handle))
+            except Exception:
+                pass
+            try:
+                pci = pynvml_module.nvmlDeviceGetPciInfo(handle)
+                device["pci_bus_id"] = safe_str(getattr(pci, "busId", ""))
+            except Exception:
+                pass
+            try:
+                cc_major, cc_minor = pynvml_module.nvmlDeviceGetCudaComputeCapability(
+                    handle
+                )
+                device["compute_capability"] = f"{cc_major}.{cc_minor}"
+            except Exception:
+                pass
+            try:
+                device["power_limit_w"] = round(
+                    float(pynvml_module.nvmlDeviceGetPowerManagementLimit(handle))
+                    / 1000.0,
+                    3,
+                )
+            except Exception:
+                pass
+        except Exception as exc:
+            device["error"] = repr(exc)
+        devices.append(device)
+
+    specs["devices"] = devices
+    return specs
+
+
+def collect_nvidia_smi_specs() -> Dict[str, Any]:
+    nvidia_smi = shutil.which("nvidia-smi")
+    specs: Dict[str, Any] = {
+        "available": bool(nvidia_smi),
+        "path": nvidia_smi or "",
+        "driver_version": None,
+        "cuda_version_reported": None,
+        "devices": [],
+    }
+    if not nvidia_smi:
+        return specs
+
+    query = run_command_capture(
+        [
+            nvidia_smi,
+            "--query-gpu=index,name,uuid,pci.bus_id,driver_version,memory.total",
+            "--format=csv,noheader,nounits",
+        ],
+        timeout_sec=5.0,
+    )
+    specs["query_returncode"] = query.get("returncode")
+    specs["query_stderr"] = query.get("stderr", "")
+
+    if query.get("available"):
+        devices: List[Dict[str, Any]] = []
+        for line in str(query.get("stdout", "")).splitlines():
+            parts = [part.strip() for part in line.split(",")]
+            if len(parts) < 6:
+                continue
+            memory_mb = safe_float(parts[5])
+            devices.append(
+                {
+                    "index": safe_int(parts[0]),
+                    "name": parts[1],
+                    "uuid": parts[2],
+                    "pci_bus_id": parts[3],
+                    "driver_version": parts[4],
+                    "total_memory_mb": memory_mb,
+                    "total_memory_gb": mb_to_gb(memory_mb),
+                }
+            )
+        specs["devices"] = devices
+        if devices:
+            specs["driver_version"] = devices[0].get("driver_version")
+
+    banner = run_command_capture([nvidia_smi], timeout_sec=5.0)
+    specs["banner_returncode"] = banner.get("returncode")
+    if banner.get("available"):
+        banner_lines = str(banner.get("stdout", "")).splitlines()
+        specs["banner_first_line"] = banner_lines[0] if banner_lines else ""
+        for line in banner_lines[:5]:
+            if "CUDA Version:" in line:
+                specs["cuda_version_reported"] = (
+                    line.split("CUDA Version:", 1)[1].split("|", 1)[0].strip()
+                )
+                break
+
+    return specs
+
+
+def collect_package_specs() -> Dict[str, Optional[str]]:
+    return {name: package_version(name) for name in PACKAGE_VERSION_NAMES}
+
+
+def collect_environment_specs() -> Dict[str, str]:
+    return {
+        name: os.environ.get(name, "")
+        for name in REPRODUCIBILITY_ENV_VARS
+        if os.environ.get(name, "") != ""
+    }
+
+
+def collect_container_specs() -> Dict[str, Any]:
+    cgroup_path = Path("/proc/1/cgroup")
+    cgroup = ""
+    try:
+        if cgroup_path.exists():
+            cgroup = cgroup_path.read_text(encoding="utf-8", errors="replace")[:4000]
+    except Exception:
+        cgroup = ""
+
+    return {
+        "in_container": Path("/.dockerenv").exists() or "docker" in cgroup.lower(),
+        "hostname_env": os.environ.get("HOSTNAME", ""),
+        "nvidia_visible_devices": os.environ.get("NVIDIA_VISIBLE_DEVICES", ""),
+        "nvidia_driver_capabilities": os.environ.get("NVIDIA_DRIVER_CAPABILITIES", ""),
+        "cgroup_excerpt": cgroup,
+    }
+
+
+def collect_machine_specs(benchmark_dir: Path) -> Dict[str, Any]:
+    psutil_module = safe_import_psutil()
+    torch_module = safe_import_torch()
+    pynvml_module = safe_import_pynvml()
+
+    return {
+        "schema_version": "1.0",
+        "captured_at": now_iso(),
+        "hostname": socket.gethostname(),
+        "os": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "version": platform.version(),
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "architecture": platform.architecture()[0],
+        },
+        "python": {
+            "version": sys.version.replace("\n", " "),
+            "version_info": list(sys.version_info[:5]),
+            "implementation": platform.python_implementation(),
+            "executable": sys.executable,
+        },
+        "cpu": collect_cpu_specs(psutil_module),
+        "memory": collect_memory_specs(psutil_module),
+        "disk_for_benchmark_dir": collect_disk_specs(benchmark_dir),
+        "torch_cuda": collect_torch_cuda_specs(torch_module),
+        "nvml": collect_nvml_specs(pynvml_module),
+        "nvidia_smi": collect_nvidia_smi_specs(),
+        "packages": collect_package_specs(),
+        "environment": collect_environment_specs(),
+        "container": collect_container_specs(),
+    }
+
+
+def summarize_machine_specs(specs: Mapping[str, Any]) -> Dict[str, Any]:
+    cpu = specs.get("cpu", {}) if isinstance(specs.get("cpu"), Mapping) else {}
+    memory = specs.get("memory", {}) if isinstance(specs.get("memory"), Mapping) else {}
+    torch_cuda = (
+        specs.get("torch_cuda", {})
+        if isinstance(specs.get("torch_cuda"), Mapping)
+        else {}
+    )
+    nvml = specs.get("nvml", {}) if isinstance(specs.get("nvml"), Mapping) else {}
+    nvidia_smi = (
+        specs.get("nvidia_smi", {})
+        if isinstance(specs.get("nvidia_smi"), Mapping)
+        else {}
+    )
+    packages = (
+        specs.get("packages", {})
+        if isinstance(specs.get("packages"), Mapping)
+        else {}
+    )
+
+    gpu_devices = (
+        torch_cuda.get("devices")
+        or nvml.get("devices")
+        or nvidia_smi.get("devices")
+        or []
+    )
+    gpu_names = [
+        str(device.get("name", ""))
+        for device in gpu_devices
+        if isinstance(device, Mapping) and device.get("name")
+    ]
+    gpu_memory_gb = [
+        safe_float(device.get("total_memory_gb"))
+        for device in gpu_devices
+        if isinstance(device, Mapping)
+        and safe_float(device.get("total_memory_gb")) is not None
+    ]
+
+    return {
+        "hostname": specs.get("hostname", ""),
+        "os": specs.get("os", {}).get("platform", "")
+        if isinstance(specs.get("os"), Mapping)
+        else "",
+        "cpu_model": cpu.get("model", ""),
+        "cpu_physical_cores": cpu.get("physical_cores"),
+        "cpu_logical_cores": cpu.get("logical_cores"),
+        "ram_total_gb": memory.get("ram_total_gb"),
+        "gpu_count": max(
+            safe_int(torch_cuda.get("device_count"), 0) or 0,
+            safe_int(nvml.get("device_count"), 0) or 0,
+            len(gpu_names),
+        ),
+        "gpu_names": gpu_names,
+        "gpu_total_memory_gb": gpu_memory_gb,
+        "nvidia_driver_version": nvml.get("driver_version")
+        or nvidia_smi.get("driver_version"),
+        "cuda_runtime_version": torch_cuda.get("cuda_runtime_version"),
+        "cudnn_version": torch_cuda.get("cudnn_version"),
+        "torch_version": packages.get("torch") or torch_cuda.get("torch_version"),
+    }
+
+
+def machine_specs_csv_row(specs: Mapping[str, Any]) -> Dict[str, Any]:
+    summary = summarize_machine_specs(specs)
+    container = (
+        specs.get("container", {})
+        if isinstance(specs.get("container"), Mapping)
+        else {}
+    )
+    environment = (
+        specs.get("environment", {})
+        if isinstance(specs.get("environment"), Mapping)
+        else {}
+    )
+    packages = (
+        specs.get("packages", {})
+        if isinstance(specs.get("packages"), Mapping)
+        else {}
+    )
+    python_specs = (
+        specs.get("python", {}) if isinstance(specs.get("python"), Mapping) else {}
+    )
+
+    row: Dict[str, Any] = {
+        "captured_at": specs.get("captured_at", ""),
+        "hostname": summary.get("hostname", ""),
+        "os": summary.get("os", ""),
+        "python_version": python_specs.get("version", ""),
+        "cpu_model": summary.get("cpu_model", ""),
+        "cpu_physical_cores": summary.get("cpu_physical_cores"),
+        "cpu_logical_cores": summary.get("cpu_logical_cores"),
+        "ram_total_gb": summary.get("ram_total_gb"),
+        "gpu_count": summary.get("gpu_count"),
+        "gpu_names": "; ".join(summary.get("gpu_names", []) or []),
+        "gpu_total_memory_gb": "; ".join(
+            str(value) for value in (summary.get("gpu_total_memory_gb", []) or [])
+        ),
+        "nvidia_driver_version": summary.get("nvidia_driver_version", ""),
+        "cuda_runtime_version": summary.get("cuda_runtime_version", ""),
+        "cudnn_version": summary.get("cudnn_version", ""),
+        "torch_version": summary.get("torch_version", ""),
+        "in_container": container.get("in_container"),
+        "cuda_visible_devices": environment.get("CUDA_VISIBLE_DEVICES", ""),
+        "nvidia_visible_devices": environment.get("NVIDIA_VISIBLE_DEVICES", ""),
+    }
+
+    for package_name in PACKAGE_VERSION_NAMES:
+        row[f"package_{package_name}"] = packages.get(package_name)
+
+    return row
+
+
 def first_existing_column(
     columns: Iterable[str], candidates: Sequence[str]
 ) -> Optional[str]:
@@ -346,11 +921,29 @@ def detect_column_roles(columns: Sequence[str]) -> Dict[str, Optional[str]]:
         ),
         "lpx": first_existing_column(
             columns,
-            ["lpx", "lpx_nm", "sigma_x", "uncertainty_x", "x_precision", "precision_x"],
+            [
+                "lpx",
+                "lpx_nm",
+                "locprecnm",
+                "loc_precision",
+                "sigma_x",
+                "uncertainty_x",
+                "x_precision",
+                "precision_x",
+            ],
         ),
         "lpy": first_existing_column(
             columns,
-            ["lpy", "lpy_nm", "sigma_y", "uncertainty_y", "y_precision", "precision_y"],
+            [
+                "lpy",
+                "lpy_nm",
+                "locprecnm",
+                "loc_precision",
+                "sigma_y",
+                "uncertainty_y",
+                "y_precision",
+                "precision_y",
+            ],
         ),
         "lpz": first_existing_column(
             columns,
@@ -420,6 +1013,328 @@ def table_numeric_values(table: Any, col: Optional[str]) -> List[float]:
             except Exception:
                 continue
     return values
+
+
+def table_xy_frame_arrays(
+    table: Any,
+    roles: Mapping[str, Optional[str]],
+    coordinate_units: str = "nm",
+    pixel_size_nm: Optional[float] = None,
+) -> Tuple[Any, Any, Any]:
+    """
+    Return aligned x/y/frame arrays in nanometers for image-based metrics.
+    """
+    np = safe_import_numpy()
+    if np is None or roles.get("x") is None or roles.get("y") is None:
+        return None, None, None
+
+    x_col = roles["x"]
+    y_col = roles["y"]
+    frame_col = roles.get("frame")
+    unit = str(coordinate_units or "nm").lower().strip()
+    scale = 1.0
+    if unit in {"pixel", "pixels", "px"}:
+        pixel_size = safe_float(pixel_size_nm)
+        if pixel_size is None or pixel_size <= 0:
+            return None, None, None
+        scale = float(pixel_size)
+
+    pd = safe_import_pandas()
+    if pd is not None and hasattr(table, "columns"):
+        if x_col not in table.columns or y_col not in table.columns:
+            return None, None, None
+        try:
+            x = pd.to_numeric(table[x_col], errors="coerce")
+            y = pd.to_numeric(table[y_col], errors="coerce")
+            mask = x.notna() & y.notna()
+            frames = None
+            if frame_col and frame_col in table.columns:
+                frames_series = pd.to_numeric(table[frame_col], errors="coerce")
+                frames = frames_series[mask].to_numpy(dtype=float)
+            return (
+                x[mask].to_numpy(dtype=float) * scale,
+                y[mask].to_numpy(dtype=float) * scale,
+                frames,
+            )
+        except Exception:
+            return None, None, None
+
+    if not isinstance(table, list):
+        return None, None, None
+
+    xs: List[float] = []
+    ys: List[float] = []
+    frames_list: List[float] = []
+    have_frame = bool(frame_col)
+    for row in table:
+        try:
+            x = float(row.get(x_col, ""))
+            y = float(row.get(y_col, ""))
+            if math.isnan(x) or math.isnan(y) or math.isinf(x) or math.isinf(y):
+                continue
+            xs.append(x * scale)
+            ys.append(y * scale)
+            if have_frame:
+                try:
+                    frames_list.append(float(row.get(frame_col, "")))
+                except Exception:
+                    frames_list.append(float("nan"))
+        except Exception:
+            continue
+
+    frames = np.asarray(frames_list, dtype=float) if have_frame else None
+    return np.asarray(xs, dtype=float), np.asarray(ys, dtype=float), frames
+
+
+def next_power_of_two_at_least(value: int, minimum: int = 64, maximum: int = 1024) -> int:
+    n = max(minimum, int(value))
+    out = 1
+    while out < n:
+        out *= 2
+    return min(maximum, out)
+
+
+def maybe_plot_frc_curve(
+    frequencies: Sequence[float],
+    frc_values: Sequence[float],
+    path: Path,
+    threshold: float,
+) -> Optional[str]:
+    plt = safe_import_matplotlib()
+    if plt is None or not frequencies or not frc_values:
+        return None
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        plt.figure(figsize=(6, 4))
+        plt.plot(list(frequencies), list(frc_values), linewidth=1.5)
+        plt.axhline(threshold, color="red", linestyle="--", linewidth=1)
+        plt.xlabel("Spatial frequency (cycles/nm)")
+        plt.ylabel("FRC")
+        plt.title("Fourier ring correlation")
+        plt.tight_layout()
+        plt.savefig(path, dpi=160)
+        plt.close()
+        return str(path)
+    except Exception:
+        try:
+            plt.close()
+        except Exception:
+            pass
+        return None
+
+
+def estimate_frc_resolution(
+    canonical_csv: Path,
+    out_dir: Path,
+    batch_index: Optional[int],
+    coordinate_units: str = "nm",
+    pixel_size_nm: Optional[float] = None,
+    threshold: float = 1.0 / 7.0,
+    max_grid_size: int = 1024,
+    min_render_pixel_nm: float = 5.0,
+    min_localizations: int = 200,
+) -> Dict[str, Any]:
+    """
+    Estimate 2D FRC resolution from two independent half maps.
+
+    The split is odd/even frame when frames are available; otherwise a fixed
+    deterministic random split is used. Coordinates are rendered into two
+    histograms, Fourier transformed, radially averaged, and crossed against the
+    1/7 threshold.
+    """
+    np = safe_import_numpy()
+    figures_dir = ensure_figures_dir(out_dir)
+    result: Dict[str, Any] = {
+        "benchmark_layer": "resolution",
+        "batch_index": batch_index,
+        "metric": "frc_resolution_1_7",
+        "value": None,
+        "unit": "nm",
+        "method": "two-half-map Fourier ring correlation, 1/7 threshold",
+        "status": "not_available",
+        "notes": "",
+        "frc_threshold": threshold,
+        "frc_curve_csv": "",
+        "frc_curve_plot": "",
+        "frc_split_method": "",
+        "frc_render_pixel_nm": None,
+        "frc_grid_size": None,
+        "frc_n_localizations": 0,
+    }
+
+    if np is None:
+        result["notes"] = "NumPy is required for FRC estimation."
+        return result
+    if not canonical_csv.exists():
+        result["status"] = "failed"
+        result["notes"] = "Canonical CSV not found."
+        return result
+
+    try:
+        table = read_table(canonical_csv)
+        roles = detect_column_roles(table_columns(table))
+        x_nm, y_nm, frames = table_xy_frame_arrays(
+            table,
+            roles,
+            coordinate_units=coordinate_units,
+            pixel_size_nm=pixel_size_nm,
+        )
+        if x_nm is None or y_nm is None or len(x_nm) < min_localizations:
+            result["notes"] = (
+                f"Need at least {min_localizations} x/y localizations for FRC."
+            )
+            result["frc_n_localizations"] = 0 if x_nm is None else int(len(x_nm))
+            return result
+
+        x_nm = np.asarray(x_nm, dtype=float)
+        y_nm = np.asarray(y_nm, dtype=float)
+        result["frc_n_localizations"] = int(len(x_nm))
+
+        if frames is not None and len(frames) == len(x_nm):
+            finite_frames = np.isfinite(frames)
+            if finite_frames.any() and len(set(frames[finite_frames].astype(int).tolist())) >= 2:
+                frame_int = np.nan_to_num(frames, nan=0.0).astype(int)
+                mask_a = (frame_int % 2) == 0
+                mask_b = ~mask_a
+                result["frc_split_method"] = "odd_even_frames"
+            else:
+                mask_a = np.zeros(len(x_nm), dtype=bool)
+                mask_a[::2] = True
+                mask_b = ~mask_a
+                result["frc_split_method"] = "alternating_rows"
+        else:
+            rng = np.random.default_rng(12345)
+            order = rng.permutation(len(x_nm))
+            mask_a = np.zeros(len(x_nm), dtype=bool)
+            mask_a[order[: len(order) // 2]] = True
+            mask_b = ~mask_a
+            result["frc_split_method"] = "deterministic_random_rows"
+
+        if int(mask_a.sum()) < 50 or int(mask_b.sum()) < 50:
+            result["notes"] = "Too few localizations in one FRC half map."
+            return result
+
+        x0 = float(np.nanmin(x_nm))
+        y0 = float(np.nanmin(y_nm))
+        x = x_nm - x0
+        y = y_nm - y0
+        width = float(np.nanmax(x) - np.nanmin(x))
+        height = float(np.nanmax(y) - np.nanmin(y))
+        fov_nm = max(width, height)
+        if fov_nm <= 0:
+            result["notes"] = "FRC requires nonzero XY field of view."
+            return result
+
+        render_pixel_nm = max(min_render_pixel_nm, fov_nm / float(max_grid_size - 1))
+        grid_size = next_power_of_two_at_least(
+            int(math.ceil(fov_nm / render_pixel_nm)) + 1,
+            minimum=64,
+            maximum=max_grid_size,
+        )
+        render_pixel_nm = fov_nm / float(max(grid_size - 1, 1))
+        if render_pixel_nm <= 0:
+            render_pixel_nm = min_render_pixel_nm
+
+        extent_nm = float(grid_size) * render_pixel_nm
+        hist_range = [[0.0, extent_nm], [0.0, extent_nm]]
+        img_a, _, _ = np.histogram2d(
+            y[mask_a], x[mask_a], bins=grid_size, range=hist_range
+        )
+        img_b, _, _ = np.histogram2d(
+            y[mask_b], x[mask_b], bins=grid_size, range=hist_range
+        )
+
+        if not np.any(img_a) or not np.any(img_b):
+            result["notes"] = "One FRC half map is empty after rendering."
+            return result
+
+        window_1d = np.hanning(grid_size)
+        window = np.outer(window_1d, window_1d)
+        img_a = (img_a - img_a.mean()) * window
+        img_b = (img_b - img_b.mean()) * window
+
+        fft_a = np.fft.fftshift(np.fft.fft2(img_a))
+        fft_b = np.fft.fftshift(np.fft.fft2(img_b))
+        freqs = np.fft.fftshift(np.fft.fftfreq(grid_size, d=render_pixel_nm))
+        fx, fy = np.meshgrid(freqs, freqs)
+        radial_freq = np.sqrt(fx**2 + fy**2)
+        freq_step = 1.0 / (grid_size * render_pixel_nm)
+        ring_index = np.floor(radial_freq / freq_step + 0.5).astype(int)
+
+        curve_rows: List[Dict[str, Any]] = []
+        frequency_values: List[float] = []
+        frc_values: List[float] = []
+        max_ring = grid_size // 2
+        for ring in range(1, max_ring + 1):
+            mask = ring_index == ring
+            if not mask.any():
+                continue
+            a = fft_a[mask]
+            b = fft_b[mask]
+            denominator = math.sqrt(float(np.sum(np.abs(a) ** 2) * np.sum(np.abs(b) ** 2)))
+            if denominator <= 0:
+                continue
+            frc = float(np.real(np.sum(a * np.conj(b))) / denominator)
+            frequency = float(ring * freq_step)
+            frequency_values.append(frequency)
+            frc_values.append(frc)
+            curve_rows.append(
+                {
+                    "batch_index": batch_index,
+                    "frequency_cycles_per_nm": frequency,
+                    "frc": frc,
+                    "threshold": threshold,
+                }
+            )
+
+        if not curve_rows:
+            result["notes"] = "FRC curve could not be computed."
+            return result
+
+        curve_csv = out_dir / f"frc_curve_batch_{batch_index or 0}.csv"
+        write_rows_csv(curve_rows, curve_csv)
+        result["frc_curve_csv"] = str(curve_csv)
+        result["frc_curve_plot"] = (
+            maybe_plot_frc_curve(
+                frequency_values,
+                frc_values,
+                figures_dir / f"frc_curve_batch_{batch_index or 0}.png",
+                threshold,
+            )
+            or ""
+        )
+        result["frc_render_pixel_nm"] = round(float(render_pixel_nm), 6)
+        result["frc_grid_size"] = int(grid_size)
+
+        crossing_frequency = None
+        for i in range(1, len(frc_values)):
+            prev_frc = frc_values[i - 1]
+            curr_frc = frc_values[i]
+            if prev_frc >= threshold and curr_frc <= threshold:
+                f0 = frequency_values[i - 1]
+                f1 = frequency_values[i]
+                if curr_frc == prev_frc:
+                    crossing_frequency = f1
+                else:
+                    alpha = (threshold - prev_frc) / (curr_frc - prev_frc)
+                    crossing_frequency = f0 + alpha * (f1 - f0)
+                break
+
+        if crossing_frequency is not None and crossing_frequency > 0:
+            result["value"] = round(float(1.0 / crossing_frequency), 6)
+            result["status"] = "passed"
+            result["notes"] = "FRC crossed the 1/7 threshold."
+        else:
+            result["status"] = "not_available"
+            result["notes"] = "FRC curve did not cross the 1/7 threshold."
+
+        return result
+
+    except Exception as exc:
+        result["status"] = "failed"
+        result["notes"] = repr(exc)
+        return result
 
 
 def ensure_figures_dir(out_dir: Path) -> Path:
@@ -644,6 +1559,7 @@ class GPUMonitor:
                 "gpu_mem_total_mb": None,
                 "gpu_temp_c": None,
                 "gpu_power_w": None,
+                "gpu_devices": [],
             }
 
         try:
@@ -651,41 +1567,103 @@ class GPUMonitor:
             if count < 1:
                 raise RuntimeError("NVML found no GPU devices")
 
-            handle = self.pynvml.nvmlDeviceGetHandleByIndex(0)
-            name = self.pynvml.nvmlDeviceGetName(handle)
-            if isinstance(name, bytes):
-                name = name.decode("utf-8", errors="replace")
-
-            mem = self.pynvml.nvmlDeviceGetMemoryInfo(handle)
-            util = self.pynvml.nvmlDeviceGetUtilizationRates(handle)
-
-            temp_c = None
-            try:
-                temp_c = float(
-                    self.pynvml.nvmlDeviceGetTemperature(
-                        handle, self.pynvml.NVML_TEMPERATURE_GPU
-                    )
-                )
-            except Exception:
-                pass
-
-            power_w = None
-            try:
-                power_w = float(self.pynvml.nvmlDeviceGetPowerUsage(handle)) / 1000.0
-            except Exception:
-                pass
-
-            return {
+            devices: List[Dict[str, Any]] = []
+            row: Dict[str, Any] = {
                 "nvml_available": True,
                 "gpu_count": count,
-                "gpu_name": name,
-                "gpu_util_percent": float(getattr(util, "gpu", 0.0)),
-                "gpu_memory_util_percent": float(getattr(util, "memory", 0.0)),
-                "gpu_mem_used_mb": bytes_to_mb(getattr(mem, "used", None)),
-                "gpu_mem_total_mb": bytes_to_mb(getattr(mem, "total", None)),
-                "gpu_temp_c": temp_c,
-                "gpu_power_w": power_w,
+                "gpu_devices": devices,
+                "gpu_name": None,
+                "gpu_util_percent": None,
+                "gpu_memory_util_percent": None,
+                "gpu_mem_used_mb": None,
+                "gpu_mem_total_mb": None,
+                "gpu_temp_c": None,
+                "gpu_power_w": None,
+                "gpu_max_util_percent": None,
+                "gpu_mean_util_percent": None,
+                "gpu_max_memory_util_percent": None,
+                "gpu_total_mem_used_mb": None,
             }
+            util_values: List[float] = []
+            mem_util_values: List[float] = []
+            used_values: List[float] = []
+
+            for index in range(count):
+                device: Dict[str, Any] = {"index": index}
+                try:
+                    handle = self.pynvml.nvmlDeviceGetHandleByIndex(index)
+                    name = safe_str(self.pynvml.nvmlDeviceGetName(handle))
+                    mem = self.pynvml.nvmlDeviceGetMemoryInfo(handle)
+                    util = self.pynvml.nvmlDeviceGetUtilizationRates(handle)
+
+                    temp_c = None
+                    try:
+                        temp_c = float(
+                            self.pynvml.nvmlDeviceGetTemperature(
+                                handle, self.pynvml.NVML_TEMPERATURE_GPU
+                            )
+                        )
+                    except Exception:
+                        pass
+
+                    power_w = None
+                    try:
+                        power_w = (
+                            float(self.pynvml.nvmlDeviceGetPowerUsage(handle))
+                            / 1000.0
+                        )
+                    except Exception:
+                        pass
+
+                    util_percent = float(getattr(util, "gpu", 0.0))
+                    mem_util_percent = float(getattr(util, "memory", 0.0))
+                    mem_used_mb = bytes_to_mb(getattr(mem, "used", None))
+                    mem_total_mb = bytes_to_mb(getattr(mem, "total", None))
+                    device.update(
+                        {
+                            "name": name,
+                            "gpu_util_percent": util_percent,
+                            "gpu_memory_util_percent": mem_util_percent,
+                            "gpu_mem_used_mb": mem_used_mb,
+                            "gpu_mem_total_mb": mem_total_mb,
+                            "gpu_temp_c": temp_c,
+                            "gpu_power_w": power_w,
+                        }
+                    )
+                    row[f"gpu{index}_name"] = name
+                    row[f"gpu{index}_util_percent"] = util_percent
+                    row[f"gpu{index}_memory_util_percent"] = mem_util_percent
+                    row[f"gpu{index}_mem_used_mb"] = mem_used_mb
+                    row[f"gpu{index}_mem_total_mb"] = mem_total_mb
+                    row[f"gpu{index}_temp_c"] = temp_c
+                    row[f"gpu{index}_power_w"] = power_w
+                    util_values.append(util_percent)
+                    mem_util_values.append(mem_util_percent)
+                    if mem_used_mb is not None:
+                        used_values.append(float(mem_used_mb))
+                except Exception as exc:
+                    device["error"] = repr(exc)
+                devices.append(device)
+
+            if devices:
+                first = devices[0]
+                row["gpu_name"] = first.get("name")
+                row["gpu_util_percent"] = first.get("gpu_util_percent")
+                row["gpu_memory_util_percent"] = first.get("gpu_memory_util_percent")
+                row["gpu_mem_used_mb"] = first.get("gpu_mem_used_mb")
+                row["gpu_mem_total_mb"] = first.get("gpu_mem_total_mb")
+                row["gpu_temp_c"] = first.get("gpu_temp_c")
+                row["gpu_power_w"] = first.get("gpu_power_w")
+            if util_values:
+                row["gpu_max_util_percent"] = max(util_values)
+                row["gpu_mean_util_percent"] = round(
+                    sum(util_values) / len(util_values), 6
+                )
+            if mem_util_values:
+                row["gpu_max_memory_util_percent"] = max(mem_util_values)
+            if used_values:
+                row["gpu_total_mem_used_mb"] = round(sum(used_values), 3)
+            return row
         except Exception:
             return {
                 "nvml_available": False,
@@ -697,6 +1675,7 @@ class GPUMonitor:
                 "gpu_mem_total_mb": None,
                 "gpu_temp_c": None,
                 "gpu_power_w": None,
+                "gpu_devices": [],
             }
 
     def snapshot(self) -> Dict[str, Any]:
@@ -894,8 +1873,11 @@ class ResourceSampler:
             "max_rss_mb": max_numeric("rss_mb"),
             "max_vms_mb": max_numeric("vms_mb"),
             "max_gpu_mem_used_mb": max_numeric("gpu_mem_used_mb"),
+            "max_gpu_total_mem_used_mb": max_numeric("gpu_total_mem_used_mb"),
             "max_gpu_util_percent": max_numeric("gpu_util_percent"),
+            "max_gpu_any_util_percent": max_numeric("gpu_max_util_percent"),
             "mean_gpu_util_percent": mean_numeric("gpu_util_percent"),
+            "mean_gpu_any_util_percent": mean_numeric("gpu_mean_util_percent"),
             "max_torch_cuda_peak_memory_allocated_mb": max_numeric(
                 "torch_cuda_peak_memory_allocated_mb"
             ),
@@ -1264,8 +2246,11 @@ def benchmark_localizations(
 
 def benchmark_resolution_proxy(
     localization_qc_row: Mapping[str, Any],
+    canonical_csv: Optional[Path],
     out_dir: Path,
     batch_index: Optional[int] = None,
+    coordinate_units: str = "nm",
+    pixel_size_nm: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Resolution proxy benchmark.
@@ -1324,22 +2309,35 @@ def benchmark_resolution_proxy(
             "notes": "Sampling density proxy, not FRC.",
         }
     )
-    rows.append(
-        {
-            "benchmark_layer": "resolution",
-            "batch_index": batch_index,
-            "metric": "frc_resolution",
-            "value": None,
-            "unit": "nm",
-            "method": "not implemented in this pure-Python helper",
-            "status": "not_available",
-            "notes": "Use Picasso/Locan/external FRC if needed.",
-        }
-    )
+    if canonical_csv is not None:
+        rows.append(
+            estimate_frc_resolution(
+                canonical_csv=canonical_csv,
+                out_dir=out_dir,
+                batch_index=batch_index,
+                coordinate_units=coordinate_units,
+                pixel_size_nm=pixel_size_nm,
+            )
+        )
+    else:
+        rows.append(
+            {
+                "benchmark_layer": "resolution",
+                "batch_index": batch_index,
+                "metric": "frc_resolution_1_7",
+                "value": None,
+                "unit": "nm",
+                "method": "two-half-map Fourier ring correlation, 1/7 threshold",
+                "status": "not_available",
+                "notes": "Canonical CSV not supplied for FRC.",
+            }
+        )
 
     write_or_replace_rows_csv(rows, out_dir / "resolution_benchmark.csv", {"benchmark_layer": "resolution", "batch_index": batch_index})
     return {
-        "status": "passed",
+        "status": "passed"
+        if any(row.get("status") == "passed" for row in rows)
+        else "not_available",
         "resolution_csv": str(out_dir / "resolution_benchmark.csv"),
         "metrics": rows,
     }
@@ -1368,6 +2366,11 @@ def benchmark_drift_proxy(
         "max_abs_dx": None,
         "max_abs_dy": None,
         "max_radial_drift": None,
+        "median_radial_drift": None,
+        "p95_radial_drift": None,
+        "linear_drift_slope_x_per_frame": None,
+        "linear_drift_slope_y_per_frame": None,
+        "linear_radial_drift_slope_per_frame": None,
         "drift_plot": "",
         "message": "",
     }
@@ -1447,6 +2450,19 @@ def benchmark_drift_proxy(
         grouped["dx"] = grouped["median_x"] - x0
         grouped["dy"] = grouped["median_y"] - y0
         grouped["radial_drift"] = (grouped["dx"] ** 2 + grouped["dy"] ** 2) ** 0.5
+        frame_span = float(grouped["frame_mid"].max() - grouped["frame_mid"].min())
+        if frame_span > 0:
+            np = safe_import_numpy()
+            if np is not None:
+                base["linear_drift_slope_x_per_frame"] = float(
+                    np.polyfit(grouped["frame_mid"], grouped["dx"], deg=1)[0]
+                )
+                base["linear_drift_slope_y_per_frame"] = float(
+                    np.polyfit(grouped["frame_mid"], grouped["dy"], deg=1)[0]
+                )
+                base["linear_radial_drift_slope_per_frame"] = float(
+                    np.polyfit(grouped["frame_mid"], grouped["radial_drift"], deg=1)[0]
+                )
 
         rows = grouped.to_dict(orient="records")
         for row in rows:
@@ -1459,6 +2475,8 @@ def benchmark_drift_proxy(
         base["max_abs_dx"] = float(grouped["dx"].abs().max())
         base["max_abs_dy"] = float(grouped["dy"].abs().max())
         base["max_radial_drift"] = float(grouped["radial_drift"].max())
+        base["median_radial_drift"] = float(grouped["radial_drift"].median())
+        base["p95_radial_drift"] = float(grouped["radial_drift"].quantile(0.95))
         base["message"] = "Drift proxy completed; interpret carefully."
         base["drift_plot"] = (
             maybe_plot_line(
@@ -1887,11 +2905,18 @@ class RuntimeBenchmark:
         self.runtime_csv_path = self.out_dir / "runtime_benchmark.csv"
         self.runtime_json_path = self.out_dir / "runtime_benchmark.json"
         self.summary_json_path = self.out_dir / "benchmark_summary.json"
+        self.machine_specs_json_path = self.out_dir / "machine_specs.json"
+        self.machine_specs_csv_path = self.out_dir / "machine_specs.csv"
+        self.comparison_summary_csv_path = self.out_dir / "comparison_ready_summary.csv"
+        self.comparison_summary_json_path = self.out_dir / "comparison_ready_summary.json"
         self.rows: List[Dict[str, Any]] = []
         self.layer_outputs: Dict[str, Any] = {}
         self.psutil = safe_import_psutil()
         self.torch = safe_import_torch()
         self.gpu = GPUMonitor()
+        self.machine_specs = collect_machine_specs(self.out_dir)
+        self.machine_specs_summary = summarize_machine_specs(self.machine_specs)
+        self.write_machine_specs()
         self.sampler = ResourceSampler(
             self.out_dir,
             sample_interval_sec=sample_interval_sec,
@@ -1918,6 +2943,9 @@ class RuntimeBenchmark:
             "cuda_available": self.cuda_available(),
             "nvml_available": self.gpu.nvml_available,
             "benchmark_dir": str(self.out_dir),
+            "machine_specs": self.machine_specs_summary,
+            "machine_specs_json": str(self.machine_specs_json_path),
+            "machine_specs_csv": str(self.machine_specs_csv_path),
         }
         self.write_runtime()
 
@@ -2052,7 +3080,12 @@ class RuntimeBenchmark:
         self.layer_outputs.setdefault("localization_qc", []).append(loc_result)
         if compute_resolution:
             res = benchmark_resolution_proxy(
-                loc_result, self.out_dir, batch_index=batch_index
+                loc_result,
+                canonical_csv_path,
+                self.out_dir,
+                batch_index=batch_index,
+                coordinate_units=coordinate_units,
+                pixel_size_nm=pixel_size_nm,
             )
             self.layer_outputs.setdefault("resolution", []).append(res)
         if compute_drift:
@@ -2091,9 +3124,65 @@ class RuntimeBenchmark:
         self.write_summary()
         return result
 
+    def add_quality_metrics_result(
+        self,
+        step: str,
+        payload: Mapping[str, Any],
+        batch_index: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        flags = payload.get("flags", [])
+        if not isinstance(flags, list):
+            flags = []
+        output_paths = payload.get("output_paths", {})
+        if not isinstance(output_paths, Mapping):
+            output_paths = {}
+
+        severities: Dict[str, int] = {}
+        for flag in flags:
+            if not isinstance(flag, Mapping):
+                continue
+            severity = str(flag.get("severity", "info"))
+            severities[severity] = severities.get(severity, 0) + 1
+
+        row = {
+            "benchmark_layer": "quality_metrics",
+            "step": step,
+            "batch_index": batch_index,
+            "status": payload.get("status", "unknown"),
+            "n_flags": len(flags),
+            "n_info": severities.get("info", 0),
+            "n_warning": severities.get("warning", 0),
+            "n_fail": severities.get("fail", 0),
+            "n_error": severities.get("error", 0),
+            "quality_metrics_json": output_paths.get("quality_metrics_json", ""),
+            "quality_metrics_md": output_paths.get("quality_metrics_md", ""),
+            "quality_summary_csv": output_paths.get("quality_summary_csv", ""),
+            "quality_flags_csv": output_paths.get("quality_flags_csv", ""),
+        }
+        write_or_replace_rows_csv(
+            [row],
+            self.out_dir / "quality_metrics_benchmark.csv",
+            {
+                "benchmark_layer": "quality_metrics",
+                "step": step,
+                "batch_index": batch_index,
+            },
+        )
+        self.layer_outputs.setdefault("quality_metrics", []).append(row)
+        self.write_summary()
+        return row
+
+    def write_machine_specs(self) -> None:
+        write_json(self.machine_specs, self.machine_specs_json_path)
+        write_rows_csv([machine_specs_csv_row(self.machine_specs)], self.machine_specs_csv_path)
+
     def write_runtime(self) -> None:
         write_json(
-            {"run_metadata": self.run_metadata, "stages": self.rows},
+            {
+                "run_metadata": self.run_metadata,
+                "machine_specs": self.machine_specs,
+                "stages": self.rows,
+            },
             self.runtime_json_path,
         )
         write_rows_csv(self.rows, self.runtime_csv_path)
@@ -2172,6 +3261,69 @@ class RuntimeBenchmark:
                 "median_of_median_lpx": numeric_percentile(med_lpx, 50),
             }
 
+        resolution_results = self.layer_outputs.get("resolution", [])
+        if resolution_results:
+            metrics: List[Mapping[str, Any]] = []
+            for item in resolution_results:
+                if isinstance(item, Mapping):
+                    item_metrics = item.get("metrics", [])
+                    if isinstance(item_metrics, list):
+                        metrics.extend(
+                            metric for metric in item_metrics if isinstance(metric, Mapping)
+                        )
+            frc_values = [
+                safe_float(metric.get("value"))
+                for metric in metrics
+                if metric.get("metric") == "frc_resolution_1_7"
+                and safe_float(metric.get("value")) is not None
+            ]
+            sampling_values = [
+                safe_float(metric.get("value"))
+                for metric in metrics
+                if metric.get("metric") == "sampling_limited_resolution_proxy"
+                and safe_float(metric.get("value")) is not None
+            ]
+            precision_values = [
+                safe_float(metric.get("value"))
+                for metric in metrics
+                if metric.get("metric") == "median_xy_localization_precision"
+                and safe_float(metric.get("value")) is not None
+            ]
+            summary["resolution"] = {
+                "n_resolution_benchmarks": len(resolution_results),
+                "n_metrics": len(metrics),
+                "n_frc_available": len(frc_values),
+                "median_frc_resolution_nm": numeric_percentile(frc_values, 50),
+                "median_sampling_limited_resolution_nm": numeric_percentile(
+                    sampling_values, 50
+                ),
+                "median_xy_localization_precision": numeric_percentile(
+                    precision_values, 50
+                ),
+            }
+
+        drift_rows = self.layer_outputs.get("drift", [])
+        if drift_rows:
+            max_drift_values = [
+                safe_float(row.get("max_radial_drift"))
+                for row in drift_rows
+                if isinstance(row, Mapping)
+                and safe_float(row.get("max_radial_drift")) is not None
+            ]
+            p95_drift_values = [
+                safe_float(row.get("p95_radial_drift"))
+                for row in drift_rows
+                if isinstance(row, Mapping)
+                and safe_float(row.get("p95_radial_drift")) is not None
+            ]
+            summary["drift"] = {
+                "n_drift_benchmarks": len(drift_rows),
+                "passed": sum(r.get("status") == "passed" for r in drift_rows),
+                "failed": sum(r.get("status") == "failed" for r in drift_rows),
+                "median_max_radial_drift": numeric_percentile(max_drift_values, 50),
+                "median_p95_radial_drift": numeric_percentile(p95_drift_values, 50),
+            }
+
         if "export_validation" in self.layer_outputs:
             export_result = self.layer_outputs["export_validation"]
             exports = export_result.get("exports", [])
@@ -2181,6 +3333,26 @@ class RuntimeBenchmark:
                 "failed": sum(r.get("status") == "failed" for r in exports),
                 "skipped": sum(r.get("status") == "skipped" for r in exports),
                 "csv": export_result.get("export_validation_csv", ""),
+            }
+
+        quality_rows = self.layer_outputs.get("quality_metrics", [])
+        if quality_rows:
+            summary["quality_metrics"] = {
+                "n_quality_runs": len(quality_rows),
+                "passed": sum(r.get("status") == "passed" for r in quality_rows),
+                "warning": sum(r.get("status") == "warning" for r in quality_rows),
+                "fail": sum(r.get("status") == "fail" for r in quality_rows),
+                "error": sum(r.get("status") == "error" for r in quality_rows),
+                "total_flags": sum(safe_int(r.get("n_flags"), 0) or 0 for r in quality_rows),
+                "total_warning_flags": sum(
+                    safe_int(r.get("n_warning"), 0) or 0 for r in quality_rows
+                ),
+                "total_fail_flags": sum(
+                    safe_int(r.get("n_fail"), 0) or 0 for r in quality_rows
+                ),
+                "total_error_flags": sum(
+                    safe_int(r.get("n_error"), 0) or 0 for r in quality_rows
+                ),
             }
 
         truth_rows = self.layer_outputs.get("truth", [])
@@ -2234,6 +3406,8 @@ class RuntimeBenchmark:
             "created_at": now_iso(),
             "benchmark_dir": str(self.out_dir),
             "run_metadata": self.run_metadata,
+            "machine_specs": self.machine_specs,
+            "machine_specs_summary": self.machine_specs_summary,
             "runtime": runtime,
             "resources": resources,
             "layers": layers,
@@ -2242,6 +3416,13 @@ class RuntimeBenchmark:
                 "runtime_json": str(self.runtime_json_path),
                 "resource_csv": str(self.sampler.csv_path),
                 "resource_json": str(self.sampler.json_path),
+                "machine_specs_json": str(self.machine_specs_json_path),
+                "machine_specs_csv": str(self.machine_specs_csv_path),
+                "comparison_ready_summary_csv": str(self.comparison_summary_csv_path),
+                "comparison_ready_summary_json": str(self.comparison_summary_json_path),
+                "quality_metrics_benchmark_csv": str(
+                    self.out_dir / "quality_metrics_benchmark.csv"
+                ),
                 "input_qc_csv": str(self.out_dir / "input_qc_benchmark.csv"),
                 "localization_qc_csv": str(
                     self.out_dir / "localization_qc_benchmark.csv"
@@ -2256,12 +3437,107 @@ class RuntimeBenchmark:
             "warnings": warnings,
         }
 
+    def comparison_ready_row(self, summary: Mapping[str, Any]) -> Dict[str, Any]:
+        layers = summary.get("layers", {})
+        if not isinstance(layers, Mapping):
+            layers = {}
+        runtime = summary.get("runtime", {})
+        if not isinstance(runtime, Mapping):
+            runtime = {}
+        resources = summary.get("resources", {})
+        if not isinstance(resources, Mapping):
+            resources = {}
+        machine = summary.get("machine_specs_summary", {})
+        if not isinstance(machine, Mapping):
+            machine = {}
+
+        input_qc = layers.get("input_qc", {})
+        loc_qc = layers.get("localization_qc", {})
+        resolution = layers.get("resolution", {})
+        drift = layers.get("drift", {})
+        truth = layers.get("truth", {})
+        quality = layers.get("quality_metrics", {})
+        export_validation = layers.get("export_validation", {})
+        if not isinstance(input_qc, Mapping):
+            input_qc = {}
+        if not isinstance(loc_qc, Mapping):
+            loc_qc = {}
+        if not isinstance(resolution, Mapping):
+            resolution = {}
+        if not isinstance(drift, Mapping):
+            drift = {}
+        if not isinstance(truth, Mapping):
+            truth = {}
+        if not isinstance(quality, Mapping):
+            quality = {}
+        if not isinstance(export_validation, Mapping):
+            export_validation = {}
+
+        return {
+            "created_at": summary.get("created_at", ""),
+            "benchmark_status": summary.get("status", ""),
+            "benchmark_dir": summary.get("benchmark_dir", ""),
+            "hostname": machine.get("hostname", ""),
+            "os": machine.get("os", ""),
+            "cpu_model": machine.get("cpu_model", ""),
+            "cpu_physical_cores": machine.get("cpu_physical_cores"),
+            "cpu_logical_cores": machine.get("cpu_logical_cores"),
+            "ram_total_gb": machine.get("ram_total_gb"),
+            "gpu_count": machine.get("gpu_count"),
+            "gpu_names": "; ".join(machine.get("gpu_names", []) or []),
+            "gpu_total_memory_gb": "; ".join(
+                str(v) for v in (machine.get("gpu_total_memory_gb", []) or [])
+            ),
+            "nvidia_driver_version": machine.get("nvidia_driver_version", ""),
+            "cuda_runtime_version": machine.get("cuda_runtime_version", ""),
+            "cudnn_version": machine.get("cudnn_version", ""),
+            "torch_version": machine.get("torch_version", ""),
+            "total_timed_sec": runtime.get("total_timed_sec"),
+            "n_timed_stages": runtime.get("n_timed_stages"),
+            "max_rss_mb": resources.get("max_rss_mb"),
+            "max_gpu_total_mem_used_mb": resources.get("max_gpu_total_mem_used_mb"),
+            "max_gpu_any_util_percent": resources.get("max_gpu_any_util_percent"),
+            "n_inputs_benchmarked": input_qc.get("n_inputs_benchmarked"),
+            "input_qc_failed": input_qc.get("failed"),
+            "n_localization_batches": loc_qc.get("n_batches_benchmarked"),
+            "total_localizations": loc_qc.get("total_localizations"),
+            "median_photons": loc_qc.get("median_of_median_photons"),
+            "median_background": loc_qc.get("median_of_median_background"),
+            "median_lpx": loc_qc.get("median_of_median_lpx"),
+            "median_xy_localization_precision": resolution.get(
+                "median_xy_localization_precision"
+            ),
+            "median_frc_resolution_nm": resolution.get("median_frc_resolution_nm"),
+            "n_frc_available": resolution.get("n_frc_available"),
+            "median_sampling_limited_resolution_nm": resolution.get(
+                "median_sampling_limited_resolution_nm"
+            ),
+            "median_max_radial_drift": drift.get("median_max_radial_drift"),
+            "median_p95_radial_drift": drift.get("median_p95_radial_drift"),
+            "truth_median_jaccard": truth.get("median_jaccard"),
+            "truth_median_f1": truth.get("median_f1"),
+            "quality_status_fail_count": quality.get("fail"),
+            "quality_status_error_count": quality.get("error"),
+            "quality_total_flags": quality.get("total_flags"),
+            "quality_warning_flags": quality.get("total_warning_flags"),
+            "quality_fail_flags": quality.get("total_fail_flags"),
+            "quality_error_flags": quality.get("total_error_flags"),
+            "export_validation_status": export_validation.get("status"),
+        }
+
+    def write_comparison_ready_summary(self, summary: Mapping[str, Any]) -> None:
+        row = self.comparison_ready_row(summary)
+        write_rows_csv([row], self.comparison_summary_csv_path)
+        write_json(row, self.comparison_summary_json_path)
+
     def write_summary(self) -> Dict[str, Any]:
         summary = self.summarize()
         write_json(summary, self.summary_json_path)
+        self.write_comparison_ready_summary(summary)
         return summary
 
     def finalize(self) -> Dict[str, Any]:
+        self.write_machine_specs()
         self.write_runtime()
         self.sampler.write()
         return self.write_summary()
