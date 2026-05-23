@@ -64,33 +64,24 @@ python run_pipeline.py train     -i INPUT -p PROFILE -o RUN_FOLDER -b BACKEND
 python run_pipeline.py infer     -i INPUT -p PROFILE -o RUN_FOLDER -b BACKEND
 ```
 
-`INPUT` can be a single file or a parent folder. The safe defaults are:
+`INPUT` can be a single file or, where noted, a parent folder:
 
 * `infer` searches parent folders recursively and runs one inference batch per
   discovered TIFF/OME-TIFF
-* `train` treats a parent folder as one training input by default
-* `calibrate` accepts one unambiguous calibration input by default; if a folder
-  contains multiple candidate TIFF/.mat/.h5 files, it asks you to be explicit
+* `train` runs one training job for one training input; a folder is treated as
+  one dataset/context, not expanded into separate jobs
+* `calibrate` runs one calibration job for one PSF/profile condition; if a
+  folder contains multiple candidate TIFF/.mat/.h5 files, it refuses to guess
 
-Only use per-file recursion for calibration/training when that is scientifically
-intended:
+For calibration, point `-i` to the exact bead stack or calibration artifact you
+want to use:
 
 ```bash
-python run_pipeline.py calibrate -i DATA_PARENT -p PROFILE -o RUN_FOLDER --recursive-inputs
-python run_pipeline.py train     -i DATA_PARENT -p PROFILE -o RUN_FOLDER --recursive-inputs
+python run_pipeline.py calibrate -i BEAD_STACK.ome.tif -p PROFILE -o RUN_FOLDER
+python run_pipeline.py calibrate -i PSF_MODEL.h5       -p PROFILE -o RUN_FOLDER
 ```
 
-The same behavior can be enabled in a lab profile:
-
-```yaml
-input:
-  calibrate:
-    recursive_inputs: true
-  train:
-    recursive_inputs: true
-```
-
-Use `--max-files N` with recursive runs for a quick smoke test.
+Use `--max-files N` with inference for a quick recursive smoke test.
 
 For now, the main backend is:
 
@@ -363,16 +354,10 @@ Typical inference outputs:
 
 ```text
 results/
-  calibration_batch_manifest.csv      # calibrate
-  training_batch_manifest.csv         # train
-  calibrations/                       # calibrate with --recursive-inputs
-    <calibration_id>/
-      runtime_liteloc_calibration.yaml
-      liteloc_calibration_adapter_status.json
-  trainings/                          # train with --recursive-inputs
-    <training_id>/
-      runtime_liteloc_train.yaml
-      liteloc_training_adapter_status.json
+  runtime_liteloc_calibration.yaml    # calibrate
+  liteloc_calibration_adapter_status.json
+  runtime_liteloc_train.yaml          # train
+  liteloc_training_adapter_status.json
   batches/
     <movie_id>/
       input_qc.json
