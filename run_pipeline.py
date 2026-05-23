@@ -83,6 +83,11 @@ TIFF_EXTENSIONS = (
     ".ome.tif",
     ".ome.tiff",
 )
+CALIBRATION_FILE_EXTENSIONS = (
+    ".mat",
+    ".h5",
+    ".hdf5",
+)
 
 VALID_STEPS = {"calibrate", "train", "infer"}
 DEFAULT_BACKEND = "liteloc"
@@ -106,10 +111,15 @@ def is_tiff(path: Path) -> bool:
     return path.is_file() and name.endswith(TIFF_EXTENSIONS)
 
 
+def is_calibration_file(path: Path) -> bool:
+    name = path.name.lower()
+    return path.is_file() and name.endswith(CALIBRATION_FILE_EXTENSIONS)
+
+
 def safe_stem(path: Path) -> str:
     name = path.name
 
-    for ext in [".ome.tiff", ".ome.tif", ".tiff", ".tif"]:
+    for ext in [".ome.tiff", ".ome.tif", ".tiff", ".tif", ".hdf5", ".h5", ".mat"]:
         if name.lower().endswith(ext):
             name = name[: -len(ext)]
             break
@@ -233,6 +243,105 @@ def discover_tiff_movies(
         movies = movies[:max_files]
 
     return movies
+
+
+def calibration_mode_from_config(
+    profile: Mapping[str, Any],
+    backend_config: Mapping[str, Any],
+) -> str:
+    return str(
+        backend_config.get("calibration_mode")
+        or get_nested(profile, ["calibration", "mode"], "auto")
+        or "auto"
+    ).strip().lower().replace("-", "_")
+
+
+def resolve_single_calibration_input(
+    input_path: Path,
+    profile: Mapping[str, Any],
+    backend_config: Mapping[str, Any],
+) -> Path:
+    """
+    Resolve exactly one calibration input.
+
+    Vector-bead calibration consumes one TIFF/OME-TIFF bead stack. Spline-file
+    calibration consumes one existing .mat/.h5/.hdf5 artifact. A folder is
+    accepted only when it contains exactly one compatible input.
+    """
+    input_path = input_path.expanduser().resolve()
+    mode = calibration_mode_from_config(profile, backend_config)
+
+    if mode in {"none", "analytic"}:
+        return input_path
+
+    if input_path.is_file():
+        if mode == "vector_beads" and not is_tiff(input_path):
+            raise ValueError(
+                f"vector_beads calibration expects one TIFF/OME-TIFF bead stack: {input_path}"
+            )
+        if mode == "spline_file" and not is_calibration_file(input_path):
+            raise ValueError(
+                f"spline_file calibration expects one .mat/.h5/.hdf5 artifact: {input_path}"
+            )
+        if mode in {"auto", ""} and not (
+            is_tiff(input_path) or is_calibration_file(input_path)
+        ):
+            raise ValueError(
+                f"Calibration input file must be TIFF/OME-TIFF, .mat, .h5, or .hdf5: {input_path}"
+            )
+        return input_path
+
+    if not input_path.is_dir():
+        raise FileNotFoundError(f"Input path does not exist: {input_path}")
+
+    if mode == "spline_file":
+        candidates = [
+            p.resolve() for p in input_path.rglob("*") if is_calibration_file(p)
+        ]
+        label = ".mat/.h5/.hdf5 calibration artifact"
+    elif mode in {"auto", ""}:
+        candidates = [p.resolve() for p in input_path.rglob("*") if is_tiff(p)]
+        label = "TIFF/OME-TIFF bead stack"
+        if not candidates:
+            candidates = [
+                p.resolve() for p in input_path.rglob("*") if is_calibration_file(p)
+            ]
+            label = ".mat/.h5/.hdf5 calibration artifact"
+    else:
+        candidates = [p.resolve() for p in input_path.rglob("*") if is_tiff(p)]
+        label = "TIFF/OME-TIFF bead stack"
+
+    candidates = sorted(candidates, key=lambda p: str(p).lower())
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise ValueError(f"No {label} found for calibration under: {input_path}")
+
+    preview = "\n".join(f"  - {path}" for path in candidates[:10])
+    more = "" if len(candidates) <= 10 else f"\n  ... {len(candidates) - 10} more"
+    raise RuntimeError(
+        "Calibration needs exactly one input for one PSF/profile condition. "
+        f"Found {len(candidates)} candidate {label} files under {input_path}:\n"
+        f"{preview}{more}\n"
+        "Point -i to the single bead stack or calibration artifact you want to use."
+    )
+
+
+def resolve_single_training_input(input_path: Path) -> Path:
+    """
+    Resolve one training job input.
+
+    A file must be TIFF/OME-TIFF. A folder is passed to LiteLoc as one dataset;
+    it is not expanded into one training job per file.
+    """
+    input_path = input_path.expanduser().resolve()
+    if input_path.is_file():
+        if not is_tiff(input_path):
+            raise ValueError(f"Training input file is not TIFF/OME-TIFF: {input_path}")
+        return input_path
+    if not input_path.is_dir():
+        raise FileNotFoundError(f"Input path does not exist: {input_path}")
+    return input_path
 
 
 # =============================================================================
@@ -1575,6 +1684,11 @@ def run_calibrate(args: argparse.Namespace) -> Dict[str, Any]:
     profile, backend_name, folders, backend_config = prepare_run_context(args)
     input_path = Path(args.i).expanduser().resolve()
     profile_path = Path(args.p).expanduser().resolve()
+    calibration_input = resolve_single_calibration_input(
+        input_path,
+        profile,
+        backend_config,
+    )
 
     if args.dry_run:
         return dry_run_result(args, profile, backend_name, folders, backend_config)
@@ -1586,17 +1700,17 @@ def run_calibrate(args: argparse.Namespace) -> Dict[str, Any]:
 
     bench = RuntimeBenchmark(out_dir=folders.benchmarks)
 
-    movies = discover_tiff_movies(input_path)
+    movies = [calibration_input] if is_tiff(calibration_input) else []
     for index, movie_path in enumerate(movies, start=1):
         bench.benchmark_input_movie(movie_path, batch_index=index)
 
     with bench.stage(
-        "backend_calibrate", input_path=input_path, out_dir=folders.results
+        "backend_calibrate", input_path=calibration_input, out_dir=folders.results
     ):
         backend_result = run_backend_step(
             step="calibrate",
             backend_name=backend_name,
-            input_path=input_path,
+            input_path=calibration_input,
             out_dir=folders.results,
             profile=profile,
             backend_config=backend_config,
@@ -1640,6 +1754,7 @@ def run_calibrate(args: argparse.Namespace) -> Dict[str, Any]:
         "step": "calibrate",
         "status": status,
         "input": str(input_path),
+        "calibration_input": str(calibration_input),
         "profile_path": str(profile_path),
         "backend_name": backend_name,
         "run_parent": str(folders.parent),
@@ -1674,6 +1789,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, Any]:
     profile, backend_name, folders, backend_config = prepare_run_context(args)
     input_path = Path(args.i).expanduser().resolve()
     profile_path = Path(args.p).expanduser().resolve()
+    training_input = resolve_single_training_input(input_path)
 
     if args.dry_run:
         return dry_run_result(args, profile, backend_name, folders, backend_config)
@@ -1685,15 +1801,15 @@ def run_train(args: argparse.Namespace) -> Dict[str, Any]:
 
     bench = RuntimeBenchmark(out_dir=folders.benchmarks)
 
-    movies = discover_tiff_movies(input_path)
+    movies = discover_tiff_movies(training_input) if training_input.is_dir() else [training_input]
     for index, movie_path in enumerate(movies, start=1):
         bench.benchmark_input_movie(movie_path, batch_index=index)
 
-    with bench.stage("backend_train", input_path=input_path, out_dir=folders.results):
+    with bench.stage("backend_train", input_path=training_input, out_dir=folders.results):
         backend_result = run_backend_step(
             step="train",
             backend_name=backend_name,
-            input_path=input_path,
+            input_path=training_input,
             out_dir=folders.results,
             profile=profile,
             backend_config=backend_config,
@@ -1738,6 +1854,7 @@ def run_train(args: argparse.Namespace) -> Dict[str, Any]:
         "step": "train",
         "status": status,
         "input": str(input_path),
+        "training_input": str(training_input),
         "profile_path": str(profile_path),
         "backend_name": backend_name,
         "run_parent": str(folders.parent),
