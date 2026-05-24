@@ -57,6 +57,20 @@ def read_csv_safe(path: Path) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def first_existing(paths: List[Path]) -> Path | None:
+    for path in paths:
+        if path.exists():
+            return path
+    return None
+
+
+def first_csv_in(folder: Path) -> Path | None:
+    if not folder.exists():
+        return None
+    candidates = sorted(path for path in folder.glob("*.csv") if path.is_file())
+    return candidates[0] if candidates else None
+
+
 def find_batch_dirs(run_dir: Path) -> List[Path]:
     """Return sorted batch folders from run_dir/batches."""
     batches_dir = run_dir / "batches"
@@ -232,10 +246,29 @@ def collect_downstream_index(
 ) -> Dict[str, Any]:
     """Create one row for downstream_exports_index.csv."""
     downstream_dir = batch_dir / "downstream_exports"
+    exports_dir = batch_dir / "exports"
 
     canonical_path = batch_dir / "canonical_localizations.csv"
-    picasso_path = downstream_dir / "picasso_thunderstorm.csv"
-    napari_path = downstream_dir / "napari_points.csv"
+    raw_path = batch_dir / "liteloc_raw_output.csv"
+    vanilla_path = first_csv_in(exports_dir / "vanilla")
+    picasso_path = first_existing(
+        [
+            exports_dir / "picasso" / "picasso_localizations.csv",
+            downstream_dir / "picasso_thunderstorm.csv",
+        ]
+    )
+    napari_path = first_existing(
+        [
+            exports_dir / "napari" / "napari_points.csv",
+            downstream_dir / "napari_points.csv",
+        ]
+    )
+    smap_path = first_existing([exports_dir / "smap" / "smap_localizations.csv"])
+    locan_path = first_existing([exports_dir / "locan" / "locan_localizations.csv"])
+    generic_path = first_existing(
+        [exports_dir / "generic" / "smlm_generic_localizations.csv"]
+    )
+    post_summary_path = batch_dir / "post_inference_summary.json"
     export_report_path = downstream_dir / "downstream_export_report.json"
 
     return {
@@ -247,8 +280,16 @@ def collect_downstream_index(
         "canonical_localizations": str(canonical_path)
         if canonical_path.exists()
         else "",
-        "picasso_thunderstorm_csv": str(picasso_path) if picasso_path.exists() else "",
-        "napari_points_csv": str(napari_path) if napari_path.exists() else "",
+        "vanilla_backend_csv": str(vanilla_path) if vanilla_path else "",
+        "raw_backend_csv": str(raw_path) if raw_path.exists() else "",
+        "picasso_thunderstorm_csv": str(picasso_path) if picasso_path else "",
+        "napari_points_csv": str(napari_path) if napari_path else "",
+        "smap_csv": str(smap_path) if smap_path else "",
+        "locan_csv": str(locan_path) if locan_path else "",
+        "generic_smlm_csv": str(generic_path) if generic_path else "",
+        "post_inference_summary": str(post_summary_path)
+        if post_summary_path.exists()
+        else "",
         "downstream_export_report": str(export_report_path)
         if export_report_path.exists()
         else "",

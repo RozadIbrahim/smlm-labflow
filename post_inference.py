@@ -18,6 +18,7 @@ It performs:
    - napari points CSV     -> exports/napari/napari_points.csv
    - Locan-style CSV       -> exports/locan/locan_localizations.csv
    - generic SMLM CSV      -> exports/generic/smlm_generic_localizations.csv
+   - untouched backend CSV -> exports/vanilla/<raw_backend_output_name>.csv
 6. Post-inference summary JSON
 
 Standard usage:
@@ -51,8 +52,10 @@ Coordinate convention:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -292,6 +295,14 @@ def write_json(data: Dict[str, Any], path: Path) -> None:
         json.dumps(data, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+
+
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def load_profile(profile_path: Optional[str | Path]) -> Dict[str, Any]:
@@ -1349,6 +1360,46 @@ def export_generic_smlm(canonical: pd.DataFrame, out_path: Path) -> Dict[str, An
     }
 
 
+def export_vanilla_backend_raw(raw_input_path: str | Path, out_dir: Path) -> Dict[str, Any]:
+    """
+    Preserve the backend output exactly as it came from inference.
+
+    This is intentionally not parsed, canonicalized, filtered, or column-mapped.
+    It gives users a plain "vanilla" artifact for auditing and backend-native
+    comparisons.
+    """
+    raw_path = Path(raw_input_path).expanduser().resolve()
+    if not raw_path.exists():
+        return {
+            "enabled": False,
+            "tool": "vanilla_backend",
+            "status": "missing_raw_input",
+            "path": "",
+            "source_path": str(raw_path),
+        }
+
+    vanilla_dir = out_dir / "exports" / "vanilla"
+    vanilla_dir.mkdir(parents=True, exist_ok=True)
+    out_path = vanilla_dir / raw_path.name
+
+    shutil.copy2(raw_path, out_path)
+
+    source_sha = file_sha256(raw_path)
+    export_sha = file_sha256(out_path)
+
+    return {
+        "enabled": True,
+        "tool": "vanilla_backend",
+        "status": "passed",
+        "path": str(out_path),
+        "source_path": str(raw_path),
+        "bytes": int(out_path.stat().st_size),
+        "source_sha256": source_sha,
+        "export_sha256": export_sha,
+        "copied_without_modification": source_sha == export_sha,
+    }
+
+
 def run_exports(
     canonical: pd.DataFrame,
     out_dir: Path,
@@ -1363,6 +1414,7 @@ def run_exports(
     export_picasso_enabled: Optional[bool] = None,
     export_napari_enabled: Optional[bool] = None,
     export_locan_enabled: Optional[bool] = None,
+    raw_input_path: Optional[str | Path] = None,
 ) -> Dict[str, Any]:
     downstream = profile.get("downstream", {}) if isinstance(profile, dict) else {}
 
@@ -1428,6 +1480,18 @@ def run_exports(
         canonical=canonical,
         out_path=out_dir / "exports" / "generic" / "smlm_generic_localizations.csv",
     )
+
+    if raw_input_path is not None:
+        report["vanilla_backend"] = export_vanilla_backend_raw(
+            raw_input_path=raw_input_path,
+            out_dir=out_dir,
+        )
+    else:
+        report["vanilla_backend"] = {
+            "enabled": False,
+            "tool": "vanilla_backend",
+            "status": "missing_raw_input",
+        }
 
     return report
 
@@ -1500,6 +1564,7 @@ def run_post_inference(
         export_picasso_enabled=export_picasso_enabled,
         export_napari_enabled=export_napari_enabled,
         export_locan_enabled=export_locan_enabled,
+        raw_input_path=input_path,
     )
 
     qc["plots"] = plot_report
