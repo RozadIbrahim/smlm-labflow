@@ -59,6 +59,7 @@ import inspect
 import json
 import re
 import sys
+import traceback
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -178,6 +179,14 @@ def write_json(data: Any, path: Path) -> None:
         json.dumps(data, indent=2, ensure_ascii=False, default=str),
         encoding="utf-8",
     )
+
+
+def read_json_safely(path: Path) -> Dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def write_text(text: str, path: Path) -> None:
@@ -1051,6 +1060,99 @@ def default_backend_log_path(step: str, out_dir: Path, profile: Mapping[str, Any
     return out_dir / str(log_name)
 
 
+def backend_status_json_path(step: str, out_dir: Path) -> Optional[Path]:
+    known_names = {
+        "calibrate": ["liteloc_calibration_adapter_status.json"],
+        "train": ["liteloc_training_adapter_status.json"],
+        "infer": ["liteloc_adapter_status.json"],
+    }
+    candidates: List[Path] = []
+    for name in known_names.get(step, []):
+        path = out_dir / name
+        if path.exists():
+            candidates.append(path)
+    for pattern in ("*adapter_status*.json", "*status*.json"):
+        candidates.extend(path for path in out_dir.glob(pattern) if path.exists())
+
+    unique: Dict[str, Path] = {str(path.resolve()): path for path in candidates}
+    if not unique:
+        return None
+    return sorted(unique.values(), key=lambda path: path.stat().st_mtime, reverse=True)[0]
+
+
+def file_tail(path: Path, *, max_lines: int = 80, max_chars: int = 12_000) -> str:
+    if not path.exists():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    lines = text.splitlines()
+    tail = "\n".join(lines[-max_lines:])
+    if len(tail) > max_chars:
+        tail = tail[-max_chars:]
+    return tail
+
+
+def traceback_from_text(text: str) -> str:
+    marker = "Traceback (most recent call last):"
+    index = text.rfind(marker)
+    if index < 0:
+        return ""
+    return text[index:].strip()
+
+
+def first_nonempty_text(*values: Any) -> str:
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def collect_backend_failure_details(
+    *,
+    step: str,
+    out_dir: Path,
+    log_path: Path,
+    wrapper_error: str,
+    wrapper_traceback: str,
+) -> Dict[str, Any]:
+    status_path = backend_status_json_path(step, out_dir)
+    status_payload = read_json_safely(status_path) if status_path else {}
+    log_tail = file_tail(log_path)
+
+    backend_error = first_nonempty_text(
+        status_payload.get("error"),
+        status_payload.get("validation_error"),
+        status_payload.get("exception"),
+        status_payload.get("backend_error"),
+        status_payload.get("backend_message"),
+        wrapper_error,
+    )
+    backend_traceback = first_nonempty_text(
+        status_payload.get("error_traceback"),
+        status_payload.get("traceback"),
+        status_payload.get("exception_traceback"),
+        traceback_from_text(log_tail),
+        wrapper_traceback,
+    )
+
+    details: Dict[str, Any] = {
+        "error": backend_error,
+        "error_traceback": backend_traceback,
+        "backend_exception": wrapper_error,
+        "wrapper_traceback": wrapper_traceback,
+        "backend_log_tail": log_tail,
+    }
+    if status_path:
+        details["status_json"] = str(status_path)
+        details["backend_status_payload"] = status_payload
+    return details
+
+
 def run_backend_step(
     step: str,
     backend_name: str,
@@ -1088,12 +1190,29 @@ def run_backend_step(
         )
     except Exception as exc:
         log_path = default_backend_log_path(step, out_dir, profile)
+        wrapper_error = repr(exc)
+        wrapper_traceback = traceback.format_exc()
+        details = collect_backend_failure_details(
+            step=step,
+            out_dir=out_dir,
+            log_path=log_path,
+            wrapper_error=wrapper_error,
+            wrapper_traceback=wrapper_traceback,
+        )
         return {
             "backend_status": "failed",
             f"{step}_status": "failed",
             "backend_name": backend_name,
-            "backend_message": repr(exc),
+            "backend_message": details.get("error") or wrapper_error,
+            "error": details.get("error") or wrapper_error,
+            "error_traceback": details.get("error_traceback") or wrapper_traceback,
+            "backend_exception": wrapper_error,
+            "wrapper_traceback": wrapper_traceback,
+            "backend_log_tail": details.get("backend_log_tail", ""),
+            "backend_status_payload": details.get("backend_status_payload", {}),
             "backend_log_path": str(log_path),
+            "log_path": str(log_path),
+            "status_json": details.get("status_json", ""),
         }
 
 
@@ -1717,8 +1836,26 @@ def run_calibrate(args: argparse.Namespace) -> Dict[str, Any]:
 
     movies = [calibration_input] if is_tiff(calibration_input) else []
     for index, movie_path in enumerate(movies, start=1):
-        bench.benchmark_input_movie(movie_path, batch_index=index)
+        progress(
+            f"Calibration input benchmark [{index}/{len(movies)}]: {movie_path.name}"
+        )
+        input_benchmark = bench.benchmark_input_movie(movie_path, batch_index=index)
+        progress(
+            "Calibration input benchmark "
+            f"[{index}/{len(movies)}]: {input_benchmark.get('status')} "
+            f"shape={input_benchmark.get('shape')} "
+            f"sampled_frames={input_benchmark.get('sampled_frames')}"
+        )
 
+    progress(
+        "LiteLoc calibration backend starting. Backend output is saved to "
+        f"{folders.results / 'liteloc_calibration.log'}."
+    )
+    write_run_status(
+        folders,
+        status="running",
+        message="LiteLoc calibration backend running.",
+    )
     with bench.stage(
         "backend_calibrate", input_path=calibration_input, out_dir=folders.results
     ):
@@ -1729,6 +1866,27 @@ def run_calibrate(args: argparse.Namespace) -> Dict[str, Any]:
             out_dir=folders.results,
             profile=profile,
             backend_config=backend_config,
+        )
+    progress(
+        f"LiteLoc calibration backend finished: {backend_result.get('backend_status')}"
+    )
+    if backend_result.get("backend_status") == "failed":
+        stream_backend_failure("Calibration backend", backend_result)
+        write_run_status(
+            folders,
+            status="failed",
+            message=first_nonempty_text(
+                backend_result.get("error"),
+                backend_result.get("backend_message"),
+                "Calibration backend failed.",
+            ),
+            extra={
+                "backend_error": backend_result.get("error", ""),
+                "backend_log": backend_result.get("log_path")
+                or backend_result.get("backend_log_path")
+                or "",
+                "backend_json": backend_result.get("status_json", ""),
+            },
         )
 
     quality_result = run_quality_metrics_safely(
@@ -1859,6 +2017,24 @@ def run_train(args: argparse.Namespace) -> Dict[str, Any]:
             backend_config=backend_config,
         )
     progress(f"LiteLoc training backend finished: {backend_result.get('backend_status')}")
+    if backend_result.get("backend_status") == "failed":
+        stream_backend_failure("Training backend", backend_result)
+        write_run_status(
+            folders,
+            status="failed",
+            message=first_nonempty_text(
+                backend_result.get("error"),
+                backend_result.get("backend_message"),
+                "Training backend failed.",
+            ),
+            extra={
+                "backend_error": backend_result.get("error", ""),
+                "backend_log": backend_result.get("log_path")
+                or backend_result.get("backend_log_path")
+                or "",
+                "backend_json": backend_result.get("status_json", ""),
+            },
+        )
 
     progress("Training quality metrics starting.")
     quality_result = run_quality_metrics_safely(
@@ -2081,6 +2257,23 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
                 f"Inference batch {index}/{len(movies)} backend finished: "
                 f"{backend_result.get('backend_status')}"
             )
+            if backend_result.get("backend_status") == "failed":
+                stream_backend_failure(
+                    f"Inference backend batch {index}/{len(movies)}", backend_result
+                )
+                write_run_status(
+                    folders,
+                    status="running",
+                    message=f"Inference batch {index}/{len(movies)} backend failed.",
+                    extra={
+                        "batch_index": index,
+                        "backend_error": backend_result.get("error", ""),
+                        "backend_log": backend_result.get("log_path")
+                        or backend_result.get("backend_log_path")
+                        or "",
+                        "backend_json": backend_result.get("status_json", ""),
+                    },
+                )
             raw_output_path = backend_result.get("raw_output_path", "")
 
             if raw_output_path:
@@ -2269,6 +2462,20 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
         "manifest_csv": str(manifest_csv),
         "manifest_json": str(manifest_json),
         "summary_json": str(summary_json),
+        "backend_failures": [
+            {
+                "batch_index": row.get("batch_index"),
+                "input_name": row.get("input_name"),
+                "input_path": row.get("input_path"),
+                "error": row.get("error") or row.get("backend_message", ""),
+                "error_traceback": row.get("error_traceback", ""),
+                "backend_exception": row.get("backend_exception", ""),
+                "log_path": row.get("log_path") or row.get("backend_log_path", ""),
+                "status_json": row.get("status_json", ""),
+            }
+            for row in rows
+            if row.get("backend_status") == "failed"
+        ],
         "benchmark": benchmark_summary,
         "combined_exports": combined_exports,
         "resolved_backend_config": backend_config,
@@ -2319,6 +2526,77 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
 # =============================================================================
 
 
+def traceback_excerpt(text: str, *, max_lines: int = 14, max_chars: int = 5000) -> str:
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    if len(text) > max_chars:
+        text = text[-max_chars:]
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    if len(lines) > max_lines:
+        lines = ["..."] + lines[-max_lines:]
+    return "\n".join(f"  {line}" for line in lines)
+
+
+def backend_failure_entries(summary: Mapping[str, Any]) -> List[Tuple[str, Mapping[str, Any]]]:
+    entries: List[Tuple[str, Mapping[str, Any]]] = []
+    backend_result = summary.get("backend_result", {})
+    if (
+        isinstance(backend_result, Mapping)
+        and backend_result.get("backend_status") == "failed"
+    ):
+        entries.append(("Backend", backend_result))
+
+    backend_failures = summary.get("backend_failures", [])
+    if isinstance(backend_failures, list):
+        for failure in backend_failures:
+            if not isinstance(failure, Mapping):
+                continue
+            batch_index = failure.get("batch_index")
+            input_name = failure.get("input_name") or failure.get("input_path") or ""
+            label = "Backend"
+            if batch_index:
+                label = f"Backend batch {batch_index}"
+            if input_name:
+                label = f"{label} ({input_name})"
+            entries.append((label, failure))
+    return entries
+
+
+def print_backend_failure(label: str, result: Mapping[str, Any]) -> None:
+    message = first_nonempty_text(
+        result.get("error"),
+        result.get("backend_message"),
+        result.get("message"),
+        result.get("backend_exception"),
+    )
+    traceback_text = first_nonempty_text(
+        result.get("error_traceback"),
+        traceback_from_text(str(result.get("backend_log_tail", ""))),
+        result.get("wrapper_traceback"),
+    )
+    log_path = result.get("log_path") or result.get("backend_log_path")
+    status_path = result.get("status_json")
+
+    if message:
+        print(f"{label} error: {message}")
+    excerpt = traceback_excerpt(traceback_text)
+    if excerpt:
+        print(f"{label} traceback:")
+        print(excerpt)
+    if log_path:
+        print(f"{label} log:   {display_path(log_path)}")
+    if status_path:
+        print(f"{label} JSON:  {display_path(status_path)}")
+
+
+def stream_backend_failure(label: str, result: Mapping[str, Any]) -> None:
+    print("=" * 70, flush=True)
+    progress(f"{label} failed; streaming backend exception details now.")
+    print_backend_failure(label, result)
+    print("=" * 70, flush=True)
+
+
 def print_footer(folders: RunFolders, summary: Mapping[str, Any]) -> None:
     status = str(summary.get("status", ""))
     print("=" * 70)
@@ -2334,22 +2612,11 @@ def print_footer(folders: RunFolders, summary: Mapping[str, Any]) -> None:
     if shared_registry != folders.registry:
         print(f"Shared registry: {display_path(shared_registry)}")
 
-    backend_result = summary.get("backend_result", {})
-    if isinstance(backend_result, Mapping) and backend_result.get("backend_status") == "failed":
-        message = (
-            backend_result.get("error")
-            or backend_result.get("message")
-            or backend_result.get("backend_message")
-            or ""
-        )
-        log_path = backend_result.get("log_path") or backend_result.get("backend_log_path")
-        status_path = backend_result.get("status_json")
-        if message:
-            print(f"Backend error: {message}")
-        if log_path:
-            print(f"Backend log:   {display_path(log_path)}")
-        if status_path:
-            print(f"Backend JSON:  {display_path(status_path)}")
+    failure_entries = backend_failure_entries(summary)
+    for label, failure in failure_entries[:3]:
+        print_backend_failure(label, failure)
+    if len(failure_entries) > 3:
+        print(f"Backend failures omitted: {len(failure_entries) - 3}")
 
     benchmark = summary.get("benchmark", {})
     if isinstance(benchmark, Mapping):
