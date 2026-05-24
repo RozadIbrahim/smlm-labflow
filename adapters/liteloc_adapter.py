@@ -922,9 +922,14 @@ def run_vector_bead_calibration(
                 calibrate_fn(calib_config)
             return_code = 0
             error = ""
+            error_traceback = ""
         except Exception as exc:
             return_code = 1
             error = repr(exc)
+            error_traceback = traceback.format_exc()
+            log.write("\nLiteLoc vector-bead calibration exception:\n")
+            log.write(error_traceback)
+            log.flush()
 
     artifact = find_new_artifact(
         search_dirs=search_dirs,
@@ -944,6 +949,7 @@ def run_vector_bead_calibration(
         "elapsed_seconds": round(time.time() - start, 3),
         "returncode": return_code,
         "error": error,
+        "error_traceback": error_traceback,
         "input_path": str(input_path),
         "out_dir": str(out_dir),
         "liteloc_root": str(runtime.repo_dir),
