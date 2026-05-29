@@ -2,7 +2,7 @@
 
 A modular pipeline wrapper for **Single-Molecule Localization Microscopy (SMLM)** analysis.
 
-It handles the engineering overhead — file discovery, QC, calibration, training, inference, export, benchmarking, and reporting — so you can focus on the science.
+It handles the engineering overhead — QC, calibration, training, inference, export, benchmarking, and reporting — so you can focus on the science.
 
 > **Status:** ready for lab use — actively developed  
 > **Current backend:** LiteLoc  
@@ -64,7 +64,8 @@ python run_pipeline.py infer \
   -i /data/raw_movies \
   -p profiles/liteloc_unified_example.yaml \
   -o outputs/my_inference \
-  -b liteloc```
+  -b liteloc
+```
 
 ---
 
