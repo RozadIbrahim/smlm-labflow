@@ -92,6 +92,14 @@ CALIBRATION_FILE_EXTENSIONS = (
 
 VALID_STEPS = {"calibrate", "train", "infer"}
 DEFAULT_BACKEND = "liteloc"
+CONCRETE_EXPORT_CHOICES = {"raw", "generic", "smap", "picasso", "napari", "locan"}
+EXPORT_CHOICES = CONCRETE_EXPORT_CHOICES | {"all", "none"}
+EXPORT_ALIASES = {
+    "backend": "raw",
+    "backend_raw": "raw",
+    "vanilla": "raw",
+    "vanilla_backend": "raw",
+}
 
 
 # =============================================================================
@@ -522,26 +530,38 @@ def infer_default_lpx_px(profile: Mapping[str, Any]) -> float:
         return 1.0
 
 
-def infer_export_setting(profile: Mapping[str, Any], name: str) -> Optional[bool]:
-    """
-    Return explicit export setting from profile, or None to let post_inference decide.
-    Supports both downstream.export_picasso and outputs.export_picasso.
-    """
-    candidates = [
-        get_nested(profile, ["downstream", f"export_{name}"], None),
-        get_nested(profile, ["outputs", f"export_{name}"], None),
-        get_nested(profile, ["exports", name], None),
-    ]
-    for value in candidates:
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            lowered = value.lower().strip()
-            if lowered in {"true", "yes", "1", "on"}:
-                return True
-            if lowered in {"false", "no", "0", "off"}:
-                return False
-    return None
+def normalize_export_choices(values: Optional[Sequence[str]]) -> set[str]:
+    if not values:
+        return {"raw"}
+
+    tokens: List[str] = []
+    for value in values:
+        tokens.extend(part.strip().lower() for part in str(value).split(","))
+
+    normalized = {
+        EXPORT_ALIASES.get(token, token)
+        for token in tokens
+        if token
+    }
+
+    invalid = normalized - EXPORT_CHOICES
+    if invalid:
+        raise ValueError(
+            "Invalid --export value(s): "
+            f"{', '.join(sorted(invalid))}. "
+            f"Expected one of: {', '.join(sorted(EXPORT_CHOICES))}."
+        )
+
+    if "none" in normalized and len(normalized) > 1:
+        raise ValueError("--export none cannot be combined with other exports.")
+
+    if "none" in normalized:
+        return set()
+
+    if "all" in normalized:
+        return set(CONCRETE_EXPORT_CHOICES)
+
+    return {value for value in normalized if value in CONCRETE_EXPORT_CHOICES}
 
 
 def profile_cli_overrides(
@@ -1277,6 +1297,7 @@ def run_post_inference_safely(
     default_lpx_px: float,
     napari_units: str,
     locan_units: str,
+    export_choices: set[str],
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     try:
         post_summary = call_with_supported_kwargs(
@@ -1294,10 +1315,12 @@ def run_post_inference_safely(
             default_lpx_px=default_lpx_px,
             napari_units=napari_units,
             locan_units=locan_units,
-            export_smap_enabled=infer_export_setting(profile, "smap"),
-            export_picasso_enabled=infer_export_setting(profile, "picasso"),
-            export_napari_enabled=infer_export_setting(profile, "napari"),
-            export_locan_enabled=infer_export_setting(profile, "locan"),
+            export_smap_enabled="smap" in export_choices,
+            export_picasso_enabled="picasso" in export_choices,
+            export_napari_enabled="napari" in export_choices,
+            export_locan_enabled="locan" in export_choices,
+            export_generic_enabled="generic" in export_choices,
+            export_raw_enabled="raw" in export_choices,
         )
 
         canonical_output_path = post_summary.get("canonical_csv", "")
@@ -1320,6 +1343,7 @@ def run_post_inference_safely(
                 "coord_units_detected", coord_units
             ),
             "pixel_size_nm": post_summary.get("pixel_size_nm", pixel_size_nm),
+            "export_choices": sorted(export_choices),
         }
         return post_summary, canonical_result, export_result
 
@@ -1798,6 +1822,10 @@ def dry_run_result(
         "n_movies_detected": len(movies) if movies is not None else None,
         "movies": [str(movie) for movie in movies] if movies is not None else [],
     }
+    if args.command == "infer":
+        result["export_choices"] = sorted(
+            normalize_export_choices(getattr(args, "export", None))
+        )
     print_header(
         step=args.command,
         input_path=Path(args.i).expanduser().resolve(),
@@ -2117,6 +2145,8 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
     if not movies:
         raise RuntimeError(f"No TIFF/OME-TIFF files found in: {input_path}")
 
+    export_choices = normalize_export_choices(getattr(args, "export", None))
+
     if args.dry_run:
         return dry_run_result(
             args, profile, backend_name, folders, backend_config, movies=movies
@@ -2185,6 +2215,7 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
             "device": backend_config.get("device", ""),
             "batch_size": backend_config.get("batch_size", ""),
             "threshold": backend_config.get("threshold", ""),
+            "export_choices": ";".join(sorted(export_choices)),
         }
         quality_result: Dict[str, Any] = {}
         truth_result: Dict[str, Any] = {}
@@ -2301,6 +2332,7 @@ def run_infer(args: argparse.Namespace) -> Dict[str, Any]:
                             default_lpx_px=default_lpx_px,
                             napari_units=napari_units,
                             locan_units=locan_units,
+                            export_choices=export_choices,
                         )
                     )
                 progress(
@@ -2738,6 +2770,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Optional quick test limit for inference.",
+    )
+    infer_parser.add_argument(
+        "--export",
+        action="append",
+        default=None,
+        metavar="{raw,generic,smap,picasso,napari,locan,all,none}",
+        help=(
+            "Downstream export to write after inference. Repeat this option or "
+            "use comma-separated values. Defaults to raw backend output only."
+        ),
     )
 
     return parser

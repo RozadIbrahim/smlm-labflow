@@ -158,21 +158,56 @@ def select_existing_columns(df: pd.DataFrame, columns: List[str]) -> pd.DataFram
     return df[existing] if existing else df
 
 
+def normalize_runtime_minutes(runtime_df: pd.DataFrame) -> pd.DataFrame:
+    if runtime_df.empty:
+        return runtime_df
+
+    runtime_df = runtime_df.copy()
+    elapsed_min = pd.Series(pd.NA, index=runtime_df.index, dtype="float64")
+
+    if "start_time" in runtime_df.columns and "end_time" in runtime_df.columns:
+        try:
+            start_time = pd.to_datetime(
+                runtime_df["start_time"],
+                errors="coerce",
+                utc=True,
+            )
+            end_time = pd.to_datetime(
+                runtime_df["end_time"],
+                errors="coerce",
+                utc=True,
+            )
+            elapsed_min = (end_time - start_time).dt.total_seconds() / 60.0
+        except Exception:
+            pass
+
+    if "elapsed_min" in runtime_df.columns:
+        existing_min = pd.to_numeric(
+            runtime_df["elapsed_min"],
+            errors="coerce",
+        )
+        elapsed_min = elapsed_min.fillna(existing_min)
+    elif "elapsed_sec" in runtime_df.columns:
+        existing_sec_min = (
+            pd.to_numeric(runtime_df["elapsed_sec"], errors="coerce") / 60.0
+        )
+        elapsed_min = elapsed_min.fillna(existing_sec_min)
+
+    runtime_df["elapsed_min"] = elapsed_min
+    return runtime_df
+
+
 def make_runtime_plot(runtime_df: pd.DataFrame, out_path: Path) -> Optional[Path]:
     if runtime_df.empty:
         return None
 
-    if "stage" not in runtime_df.columns or "elapsed_sec" not in runtime_df.columns:
+    runtime_df = normalize_runtime_minutes(runtime_df)
+
+    if "stage" not in runtime_df.columns or "elapsed_min" not in runtime_df.columns:
         return None
 
-    runtime_df = runtime_df.copy()
-    runtime_df["elapsed_sec"] = pd.to_numeric(
-        runtime_df["elapsed_sec"],
-        errors="coerce",
-    )
-
     grouped = (
-        runtime_df.groupby("stage", dropna=False)["elapsed_sec"]
+        runtime_df.groupby("stage", dropna=False)["elapsed_min"]
         .sum()
         .sort_values(ascending=False)
     )
@@ -182,7 +217,7 @@ def make_runtime_plot(runtime_df: pd.DataFrame, out_path: Path) -> Optional[Path
 
     plt.figure(figsize=(8, 4.5))
     grouped.plot(kind="bar")
-    plt.ylabel("Total runtime (sec)")
+    plt.ylabel("Total runtime (min)")
     plt.xlabel("Pipeline stage")
     plt.title("Runtime by pipeline stage")
     plt.xticks(rotation=35, ha="right")
@@ -316,11 +351,12 @@ def generate_markdown_report(
     if not batch_df.empty and "canonical_status" in batch_df.columns:
         canonical_passed = int((batch_df["canonical_status"] == "passed").sum())
 
+    runtime_df = normalize_runtime_minutes(runtime_df)
     runtime_total = "NA"
 
-    if not runtime_df.empty and "elapsed_sec" in runtime_df.columns:
+    if not runtime_df.empty and "elapsed_min" in runtime_df.columns:
         runtime_total = round(
-            float(pd.to_numeric(runtime_df["elapsed_sec"], errors="coerce").sum()),
+            float(pd.to_numeric(runtime_df["elapsed_min"], errors="coerce").sum()),
             3,
         )
 
@@ -339,7 +375,7 @@ def generate_markdown_report(
     runtime_cols = [
         "stage",
         "batch_index",
-        "elapsed_sec",
+        "elapsed_min",
         "status",
         "rss_mb",
         "process_cpu_percent",
@@ -366,7 +402,7 @@ def generate_markdown_report(
         f"- Movies processed: **{n_movies}**",
         f"- QC passed: **{qc_passed}/{n_movies}**",
         f"- Canonical conversion passed: **{canonical_passed}/{n_movies}**",
-        f"- Total timed runtime: **{runtime_total} sec**",
+        f"- Total timed runtime: **{runtime_total} min**",
         "",
         "## Batch summary",
         "",
@@ -435,12 +471,13 @@ def generate_html_report(
     if not batch_df.empty and "canonical_status" in batch_df.columns:
         canonical_passed = int((batch_df["canonical_status"] == "passed").sum())
 
+    runtime_df = normalize_runtime_minutes(runtime_df)
     runtime_total = "NA"
 
-    if not runtime_df.empty and "elapsed_sec" in runtime_df.columns:
+    if not runtime_df.empty and "elapsed_min" in runtime_df.columns:
         runtime_total = str(
             round(
-                float(pd.to_numeric(runtime_df["elapsed_sec"], errors="coerce").sum()),
+                float(pd.to_numeric(runtime_df["elapsed_min"], errors="coerce").sum()),
                 3,
             )
         )
@@ -475,7 +512,7 @@ def generate_html_report(
     runtime_cols = [
         "stage",
         "batch_index",
-        "elapsed_sec",
+        "elapsed_min",
         "status",
         "rss_mb",
         "process_cpu_percent",
@@ -615,7 +652,7 @@ def generate_html_report(
     </div>
     <div class="metric">
         <div class="label">Timed runtime</div>
-        <div class="value">{runtime_total} sec</div>
+        <div class="value">{runtime_total} min</div>
     </div>
 </div>
 

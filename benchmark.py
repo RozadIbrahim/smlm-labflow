@@ -78,7 +78,25 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
 def now_iso() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now().isoformat(timespec="microseconds")
+
+
+def elapsed_minutes_between(start_time: Any, end_time: Any) -> Optional[float]:
+    try:
+        start_text = str(start_time).strip()
+        end_text = str(end_time).strip()
+        if not start_text or not end_text:
+            return None
+        start_dt = datetime.fromisoformat(start_text.replace("Z", "+00:00"))
+        end_dt = datetime.fromisoformat(end_text.replace("Z", "+00:00"))
+        if (start_dt.tzinfo is None) != (end_dt.tzinfo is None):
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=end_dt.tzinfo)
+            else:
+                end_dt = end_dt.replace(tzinfo=start_dt.tzinfo)
+        return (end_dt - start_dt).total_seconds() / 60.0
+    except Exception:
+        return None
 
 
 def bytes_to_mb(value: Optional[int | float]) -> Optional[float]:
@@ -118,6 +136,19 @@ def safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
         return int(value)
     except Exception:
         return default
+
+
+def runtime_row_elapsed_min(row: Mapping[str, Any]) -> float:
+    elapsed = elapsed_minutes_between(row.get("start_time"), row.get("end_time"))
+    if elapsed is not None:
+        return elapsed
+
+    elapsed = safe_float(row.get("elapsed_min"))
+    if elapsed is not None:
+        return elapsed
+
+    elapsed_sec = safe_float(row.get("elapsed_sec"), 0.0) or 0.0
+    return elapsed_sec / 60.0
 
 
 def safe_str(value: Any) -> str:
@@ -3040,6 +3071,10 @@ class RuntimeBenchmark:
 
         try:
             yield
+        except (KeyboardInterrupt, SystemExit) as exc:
+            status = "interrupted"
+            error = repr(exc)
+            raise
         except Exception as exc:
             status = "failed"
             error = repr(exc)
@@ -3049,6 +3084,9 @@ class RuntimeBenchmark:
             self.cuda_sync()
             end = time.perf_counter()
             end_time = now_iso()
+            elapsed_min = elapsed_minutes_between(start_time, end_time)
+            if elapsed_min is None:
+                elapsed_min = (end - start) / 60.0
             row: Dict[str, Any] = {
                 "benchmark_layer": "runtime",
                 "stage": stage_name,
@@ -3059,7 +3097,7 @@ class RuntimeBenchmark:
                 "error": error,
                 "start_time": start_time,
                 "end_time": end_time,
-                "elapsed_sec": round(end - start, 6),
+                "elapsed_min": round(elapsed_min, 6),
             }
             row.update(self.get_ram_mb())
             row.update(self.get_cpu_percent())
@@ -3219,7 +3257,7 @@ class RuntimeBenchmark:
         total = 0.0
         by_stage: Dict[str, float] = {}
         for row in self.rows:
-            elapsed = safe_float(row.get("elapsed_sec"), 0.0) or 0.0
+            elapsed = runtime_row_elapsed_min(row)
             stage = str(row.get("stage", "unknown"))
             total += elapsed
             by_stage[stage] = by_stage.get(stage, 0.0) + elapsed
@@ -3230,15 +3268,15 @@ class RuntimeBenchmark:
                 [float(v) for v in by_stage.values()],
                 self.figures_dir / "stage_runtime_barplot.png",
                 "Runtime by stage",
-                "Seconds",
+                "Minutes",
             )
 
         return {
             "runtime_csv": str(self.runtime_csv_path),
             "runtime_json": str(self.runtime_json_path),
             "n_timed_stages": len(self.rows),
-            "total_timed_sec": round(total, 6),
-            "time_by_stage_sec": {
+            "total_timed_min": round(total, 6),
+            "time_by_stage_min": {
                 stage: round(value, 6) for stage, value in sorted(by_stage.items())
             },
         }
@@ -3501,6 +3539,15 @@ class RuntimeBenchmark:
         if not isinstance(export_validation, Mapping):
             export_validation = {}
 
+        total_timed_min = runtime.get("total_timed_min")
+        if total_timed_min is None and runtime.get("total_timed_sec") is not None:
+            total_timed_sec = safe_float(runtime.get("total_timed_sec"))
+            total_timed_min = (
+                round(total_timed_sec / 60.0, 6)
+                if total_timed_sec is not None
+                else None
+            )
+
         return {
             "created_at": summary.get("created_at", ""),
             "benchmark_status": summary.get("status", ""),
@@ -3520,7 +3567,7 @@ class RuntimeBenchmark:
             "cuda_runtime_version": machine.get("cuda_runtime_version", ""),
             "cudnn_version": machine.get("cudnn_version", ""),
             "torch_version": machine.get("torch_version", ""),
-            "total_timed_sec": runtime.get("total_timed_sec"),
+            "total_timed_min": total_timed_min,
             "n_timed_stages": runtime.get("n_timed_stages"),
             "max_rss_mb": resources.get("max_rss_mb"),
             "max_gpu_total_mem_used_mb": resources.get("max_gpu_total_mem_used_mb"),
@@ -3583,10 +3630,11 @@ def inspect_runtime_json(path: Path) -> None:
     print(f"Timed stages: {len(stages)}")
     print()
     for row in stages:
+        elapsed_min = runtime_row_elapsed_min(row)
         print(
             f"{row.get('stage', ''):28s} "
             f"batch={str(row.get('batch_index', '')):>4s} "
-            f"time={row.get('elapsed_sec', '')} sec "
+            f"time={round(elapsed_min, 6)} min "
             f"status={row.get('status', '')}"
         )
 

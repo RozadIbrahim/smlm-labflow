@@ -73,6 +73,16 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
+CONCRETE_EXPORT_CHOICES = {"raw", "generic", "smap", "picasso", "napari", "locan"}
+EXPORT_CHOICES = CONCRETE_EXPORT_CHOICES | {"all", "none"}
+EXPORT_ALIASES = {
+    "backend": "raw",
+    "backend_raw": "raw",
+    "vanilla": "raw",
+    "vanilla_backend": "raw",
+}
+
+
 # =============================================================================
 # Canonical schema
 # =============================================================================
@@ -274,7 +284,74 @@ COLUMN_ALIASES = {
 
 
 def now_iso() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now().isoformat(timespec="microseconds")
+
+
+def elapsed_minutes_between(start_time: Any, end_time: Any) -> Optional[float]:
+    try:
+        start_dt = datetime.fromisoformat(str(start_time).replace("Z", "+00:00"))
+        end_dt = datetime.fromisoformat(str(end_time).replace("Z", "+00:00"))
+        return (end_dt - start_dt).total_seconds() / 60.0
+    except Exception:
+        return None
+
+
+def timing_record(start_time: str, end_time: str) -> Dict[str, Any]:
+    elapsed_min = elapsed_minutes_between(start_time, end_time)
+    return {
+        "start_time": start_time,
+        "end_time": end_time,
+        "elapsed_min": round(elapsed_min, 6) if elapsed_min is not None else None,
+    }
+
+
+def run_timed(
+    timing: Dict[str, Any],
+    name: str,
+    func,
+    *args,
+    **kwargs,
+):
+    start_time = now_iso()
+    try:
+        return func(*args, **kwargs)
+    finally:
+        end_time = now_iso()
+        timing[name] = timing_record(start_time, end_time)
+
+
+def normalize_export_choices(values: Optional[list[str]]) -> set[str]:
+    if not values:
+        return {"raw"}
+
+    tokens: list[str] = []
+    for value in values:
+        tokens.extend(part.strip().lower() for part in str(value).split(","))
+
+    normalized = {
+        EXPORT_ALIASES.get(token, token)
+        for token in tokens
+        if token
+    }
+
+    invalid = normalized - EXPORT_CHOICES
+    if invalid:
+        raise ValueError(
+            "Invalid --export value(s): "
+            f"{', '.join(sorted(invalid))}. "
+            f"Expected one of: {', '.join(sorted(EXPORT_CHOICES))}."
+        )
+
+    if "none" in normalized and len(normalized) > 1:
+        raise ValueError("--export none cannot be combined with other exports.")
+
+    if "none" in normalized:
+        return set()
+
+    if "all" in normalized:
+        return set(CONCRETE_EXPORT_CHOICES)
+
+    return {value for value in normalized if value in CONCRETE_EXPORT_CHOICES}
 
 
 def normalize_name(name: str) -> str:
@@ -1414,85 +1491,127 @@ def run_exports(
     export_picasso_enabled: Optional[bool] = None,
     export_napari_enabled: Optional[bool] = None,
     export_locan_enabled: Optional[bool] = None,
+    export_generic_enabled: Optional[bool] = None,
+    export_raw_enabled: Optional[bool] = None,
     raw_input_path: Optional[str | Path] = None,
 ) -> Dict[str, Any]:
     downstream = profile.get("downstream", {}) if isinstance(profile, dict) else {}
 
     if export_smap_enabled is None:
-        export_smap_enabled = bool(downstream.get("export_smap", True))
+        export_smap_enabled = bool(downstream.get("export_smap", False))
 
     if export_picasso_enabled is None:
-        export_picasso_enabled = bool(downstream.get("export_picasso", True))
+        export_picasso_enabled = bool(downstream.get("export_picasso", False))
 
     if export_napari_enabled is None:
-        export_napari_enabled = bool(downstream.get("export_napari", True))
+        export_napari_enabled = bool(downstream.get("export_napari", False))
 
     if export_locan_enabled is None:
-        export_locan_enabled = bool(downstream.get("export_locan", True))
+        export_locan_enabled = bool(downstream.get("export_locan", False))
+
+    if export_generic_enabled is None:
+        export_generic_enabled = bool(downstream.get("export_generic", False))
+
+    if export_raw_enabled is None:
+        export_raw_enabled = bool(downstream.get("export_raw", True))
 
     report: Dict[str, Any] = {}
+    export_timing: Dict[str, Any] = {}
 
     if export_smap_enabled:
-        report["smap"] = export_smap(
+        report["smap"] = run_timed(
+            export_timing,
+            "smap",
+            export_smap,
             canonical=canonical,
             out_path=out_dir / "exports" / "smap" / "smap_localizations.csv",
             coord_units=coord_units,
             pixel_size_nm=pixel_size_nm,
             default_locprec_nm=default_locprec_nm,
         )
+        report["smap"]["timing"] = export_timing["smap"]
     else:
         report["smap"] = {"enabled": False}
 
     if export_picasso_enabled:
-        report["picasso"] = export_picasso(
+        report["picasso"] = run_timed(
+            export_timing,
+            "picasso",
+            export_picasso,
             canonical=canonical,
             out_path=out_dir / "exports" / "picasso" / "picasso_localizations.csv",
             coord_units=coord_units,
             pixel_size_nm=pixel_size_nm,
             default_lpx_px=default_lpx_px,
         )
+        report["picasso"]["timing"] = export_timing["picasso"]
     else:
         report["picasso"] = {"enabled": False}
 
     if export_napari_enabled:
-        report["napari"] = export_napari_points(
+        report["napari"] = run_timed(
+            export_timing,
+            "napari",
+            export_napari_points,
             canonical=canonical,
             out_path=out_dir / "exports" / "napari" / "napari_points.csv",
             coord_units=coord_units,
             pixel_size_nm=pixel_size_nm,
             napari_units=napari_units,
         )
+        report["napari"]["timing"] = export_timing["napari"]
     else:
         report["napari"] = {"enabled": False}
 
     if export_locan_enabled:
-        report["locan"] = export_locan(
+        report["locan"] = run_timed(
+            export_timing,
+            "locan",
+            export_locan,
             canonical=canonical,
             out_path=out_dir / "exports" / "locan" / "locan_localizations.csv",
             coord_units=coord_units,
             pixel_size_nm=pixel_size_nm,
             locan_units=locan_units,
         )
+        report["locan"]["timing"] = export_timing["locan"]
     else:
         report["locan"] = {"enabled": False}
 
-    report["generic_smlm"] = export_generic_smlm(
-        canonical=canonical,
-        out_path=out_dir / "exports" / "generic" / "smlm_generic_localizations.csv",
-    )
+    if export_generic_enabled:
+        report["generic_smlm"] = run_timed(
+            export_timing,
+            "generic_smlm",
+            export_generic_smlm,
+            canonical=canonical,
+            out_path=out_dir / "exports" / "generic" / "smlm_generic_localizations.csv",
+        )
+        report["generic_smlm"]["timing"] = export_timing["generic_smlm"]
+    else:
+        report["generic_smlm"] = {"enabled": False}
 
-    if raw_input_path is not None:
-        report["vanilla_backend"] = export_vanilla_backend_raw(
+    if export_raw_enabled and raw_input_path is not None:
+        report["vanilla_backend"] = run_timed(
+            export_timing,
+            "vanilla_backend",
+            export_vanilla_backend_raw,
             raw_input_path=raw_input_path,
             out_dir=out_dir,
         )
-    else:
+        report["vanilla_backend"]["timing"] = export_timing["vanilla_backend"]
+    elif export_raw_enabled:
         report["vanilla_backend"] = {
             "enabled": False,
             "tool": "vanilla_backend",
             "status": "missing_raw_input",
         }
+    else:
+        report["vanilla_backend"] = {
+            "enabled": False,
+            "tool": "vanilla_backend",
+        }
 
+    report["timing"] = export_timing
     return report
 
 
@@ -1519,14 +1638,21 @@ def run_post_inference(
     export_picasso_enabled: Optional[bool] = None,
     export_napari_enabled: Optional[bool] = None,
     export_locan_enabled: Optional[bool] = None,
+    export_generic_enabled: Optional[bool] = None,
+    export_raw_enabled: Optional[bool] = None,
 ) -> Dict[str, Any]:
     profile = profile or {}
+    post_start_time = now_iso()
+    timing: Dict[str, Any] = {}
 
     input_path = Path(input_path).expanduser().resolve()
     out_dir = Path(out_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    canonical, conversion_report, canonical_path = convert_inference_to_canonical(
+    canonical, conversion_report, canonical_path = run_timed(
+        timing,
+        "canonical_conversion",
+        convert_inference_to_canonical,
         input_path=input_path,
         out_dir=out_dir,
         profile=profile,
@@ -1538,19 +1664,28 @@ def run_post_inference(
 
     resolved_coord_units = infer_coord_units(canonical, coord_units)
 
-    qc = compute_localization_qc(
+    qc = run_timed(
+        timing,
+        "localization_qc",
+        compute_localization_qc,
         canonical=canonical,
         conversion_report=conversion_report,
         coord_units=resolved_coord_units,
         pixel_size_nm=pixel_size_nm,
     )
 
-    plot_report = generate_qc_plots(
+    plot_report = run_timed(
+        timing,
+        "qc_plots",
+        generate_qc_plots,
         canonical=canonical,
         out_dir=out_dir,
     )
 
-    export_report = run_exports(
+    export_report = run_timed(
+        timing,
+        "exports_total",
+        run_exports,
         canonical=canonical,
         out_dir=out_dir,
         profile=profile,
@@ -1564,14 +1699,20 @@ def run_post_inference(
         export_picasso_enabled=export_picasso_enabled,
         export_napari_enabled=export_napari_enabled,
         export_locan_enabled=export_locan_enabled,
+        export_generic_enabled=export_generic_enabled,
+        export_raw_enabled=export_raw_enabled,
         raw_input_path=input_path,
     )
+    export_timing = export_report.pop("timing", {})
+    timing["exports"] = export_timing
 
     qc["plots"] = plot_report
     qc["exports"] = export_report
 
     qc_path = out_dir / "localization_qc.json"
-    write_json(qc, qc_path)
+    run_timed(timing, "write_localization_qc_json", write_json, qc, qc_path)
+
+    timing["total_before_summary_write"] = timing_record(post_start_time, now_iso())
 
     summary = {
         "created_at": now_iso(),
@@ -1590,6 +1731,12 @@ def run_post_inference(
         "pixel_size_nm": pixel_size_nm,
         "plots": plot_report,
         "exports": export_report,
+        "timing": timing,
+        "export_choices": [
+            name
+            for name, report in export_report.items()
+            if isinstance(report, dict) and report.get("enabled")
+        ],
         "n_localizations": int(len(canonical)),
         "quality_flags": qc["quality_flags"],
     }
@@ -1700,6 +1847,16 @@ def parse_args() -> argparse.Namespace:
         help="Do not drop rows with missing x/y from canonical output.",
     )
 
+    parser.add_argument(
+        "--export",
+        action="append",
+        default=None,
+        metavar="{raw,generic,smap,picasso,napari,locan,all,none}",
+        help=(
+            "Downstream export to write. Repeat this option or use comma-separated "
+            "values. Defaults to raw backend output only."
+        ),
+    )
     parser.add_argument("--no-smap", action="store_true", help="Disable SMAP export.")
     parser.add_argument(
         "--no-picasso", action="store_true", help="Disable Picasso export."
@@ -1728,6 +1885,15 @@ def main() -> None:
         profile=profile,
         cli_pixel_size_nm=args.pixel_size_nm,
     )
+    export_choices = normalize_export_choices(args.export)
+    if args.no_smap:
+        export_choices.discard("smap")
+    if args.no_picasso:
+        export_choices.discard("picasso")
+    if args.no_napari:
+        export_choices.discard("napari")
+    if args.no_locan:
+        export_choices.discard("locan")
 
     print("=" * 70)
     print("Post-inference processing")
@@ -1738,6 +1904,7 @@ def main() -> None:
     print(f"Backend:       {backend}")
     print(f"Coord units:   {args.coord_units}")
     print(f"Pixel size nm: {pixel_size_nm}")
+    print(f"Exports:       {', '.join(sorted(export_choices)) if export_choices else 'none'}")
     print("=" * 70)
 
     summary = run_post_inference(
@@ -1754,10 +1921,12 @@ def main() -> None:
         napari_units=args.napari_units,
         locan_units=args.locan_units,
         drop_missing_xy=not args.keep_missing_xy,
-        export_smap_enabled=not args.no_smap,
-        export_picasso_enabled=not args.no_picasso,
-        export_napari_enabled=not args.no_napari,
-        export_locan_enabled=not args.no_locan,
+        export_smap_enabled="smap" in export_choices,
+        export_picasso_enabled="picasso" in export_choices,
+        export_napari_enabled="napari" in export_choices,
+        export_locan_enabled="locan" in export_choices,
+        export_generic_enabled="generic" in export_choices,
+        export_raw_enabled="raw" in export_choices,
     )
 
     print("[post] Saved:")
