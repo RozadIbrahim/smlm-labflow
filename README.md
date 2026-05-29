@@ -238,8 +238,25 @@ External tools (LiteLoc, downstream SMLM tools) remain governed by their own lic
 If you use this pipeline, please cite:
 
 1. **SMLM LabFlow** (this repository)
-2. The **backend localization tool** used (e.g., LiteLoc)
+2. **LiteLoc** — the backend localization engine
 3. Any **downstream analysis tools** applied to results
+
+### LiteLoc
+
+> Li, Y. et al. *Scalable and lightweight deep learning for efficient high accuracy single-molecule localization microscopy.* **Nature Communications** (2025). https://doi.org/10.1038/s41467-025-62662-5
+
+```bibtex
+@article{li2025liteloc,
+  author  = {Li, Yue and others},
+  title   = {Scalable and lightweight deep learning for efficient high accuracy single-molecule localization microscopy},
+  journal = {Nature Communications},
+  year    = {2025},
+  doi     = {10.1038/s41467-025-62662-5},
+  url     = {https://www.nature.com/articles/s41467-025-62662-5}
+}
+```
+
+### SMLM LabFlow
 
 ```bibtex
 @software{smlm_labflow_2026,
