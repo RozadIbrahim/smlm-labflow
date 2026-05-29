@@ -193,16 +193,6 @@ python combine_benchmark_comparisons.py results -o comparison_summary_all_runs.c
 
 ---
 
-## Syntax checks
-
-```bash
-python -m py_compile run_pipeline.py
-python -m py_compile adapters/resolver.py
-python -m py_compile adapters/liteloc_adapter.py
-python -m py_compile qc_input.py post_inference.py benchmark.py
-```
-
----
 
 ## Roadmap
 
